@@ -21,7 +21,7 @@
 constexpr const char* SHM_NAME = "/shm_pubsub_mq";       // 共享内存名称
 constexpr size_t MAX_WRITERS = 8;                        // 最大写进程数
 constexpr size_t MAX_READERS = 16;                       // 最大读进程数
-constexpr size_t BLOCK_COUNT = 64;                       // 固定数据块数量
+constexpr size_t BLOCK_COUNT = 32;                       // 固定数据块数量
 constexpr size_t BLOCK_SIZE = 4096;                      // 单个数据块大小（含长度字段）
 constexpr size_t QUEUE_CAPACITY = 32;                    // 每个读进程接收队列容量
 constexpr uint64_t HEARTBEAT_TIMEOUT = 5000;             // 进程心跳超时（5秒）
@@ -74,6 +74,7 @@ struct AtomicQueue {
             std::memory_order_relaxed)) {
             return true;
         }
+        throw std::runtime_error("[ShmPubSub] dequeue failed");
         return false;  // 并发冲突，重试后仍失败
     }
     
@@ -125,8 +126,7 @@ struct SharedMeta {
     std::atomic<bool> inited = {false};                          // 初始化标记
     size_t block_count = BLOCK_COUNT;                            // 数据块总数
     size_t block_size = BLOCK_SIZE;                              // 单个块大小
-    std::atomic<size_t> free_block_top = {0};                    // 可用块栈顶指针（无锁）
-    size_t free_blocks[BLOCK_COUNT] = {0};                       // 可用块ID栈（0~BLOCK_COUNT-1）
+    LockFreeFreeList<uint32_t, BLOCK_COUNT> free_list;
     WriterInfo writers[MAX_WRITERS] = {0};                       // 写进程数组
     ReaderInfo readers[MAX_READERS] = {0};                       // 读进程数组
 };
@@ -169,7 +169,7 @@ public:
         }
 
         // 2. 无锁申请可用块（CAS操作pop栈顶）
-        size_t block_id = 0;
+        uint32_t block_id = 0;
         if (!alloc_block(block_id)) {
             std::cerr << "No free blocks for publish" << std::endl;
             return false;
@@ -182,16 +182,18 @@ public:
         block->data_len = std::min(data_len, sizeof(block->data));
         memcpy(block->data, data, block->data_len);
 
-        // 4. 遍历所有订阅者，将块ID入队到其接收队列（无锁）
+        // 4. 发布者释放块所有权（不再直接归还块，由引用计数控制）
+        block->owner_pid.store(0, std::memory_order_release);
+
+        // 5. 遍历所有订阅者，将块ID入队到其接收队列（无锁）
         for (size_t i = 0; i < MAX_READERS; ++i) {
             ReaderInfo& reader = meta_->readers[i];
             if (reader.online.load(std::memory_order_acquire) && reader.subscribed) {
-                reader.recv_queue.enqueue(block_id);
+                if(reader.recv_queue.enqueue(block_id) == false)
+                    throw std::runtime_error("enqueue failed");
             }
         }
 
-        // 5. 发布者释放块所有权（不再直接归还块，由引用计数控制）
-        block->owner_pid.store(0, std::memory_order_release);
         return true;
     }
 
@@ -255,8 +257,6 @@ public:
 
         // 消费后直接回收块（原子无锁，不会冲突）
         free_block(block_id);
-        std::cout << "Subscriber " << getpid() << " received: " << std::string((char*)buf, actual_len) << ", block " << block_id << " recycled" << std::endl;
-
         return true;
     }
 
@@ -288,7 +288,7 @@ private:
 
         // 5. 拆分元数据区和数据块区
         meta_ = static_cast<SharedMeta*>(shm_ptr_);
-        blocks_ = reinterpret_cast<DataBlock*>(static_cast<char*>(shm_ptr_) + sizeof(SharedMeta));
+        blocks_ = reinterpret_cast<DataBlock*>(reinterpret_cast<char*>(shm_ptr_) + sizeof(SharedMeta));
 
         // 6. 初始化共享内存（仅第一个进程执行）
         if (!meta_->inited.load(std::memory_order_acquire)) {
@@ -297,17 +297,10 @@ private:
                 expected, true,  // expected是普通变量，存储预期的false
                 std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
-                init_free_blocks();  // 初始化可用块栈
+                meta_->free_list.init();
             }
         }
-    }
-
-    // 初始化可用块栈（0~BLOCK_COUNT-1依次入栈）
-    void init_free_blocks() {
-        for (size_t i = 0; i < BLOCK_COUNT; ++i) {
-            meta_->free_blocks[i] = i;
-        }
-        meta_->free_block_top.store(BLOCK_COUNT, std::memory_order_release);
+        meta_->free_list.print_list();
     }
 
     // 注册当前进程到共享内存元数据
@@ -447,6 +440,8 @@ private:
     void recycle_offline_readers(uint64_t now) {
         for (size_t i = 0; i < MAX_READERS; ++i) {
             ReaderInfo& reader = meta_->readers[i];
+            if (now < reader.heartbeat.load(std::memory_order_acquire))
+                throw std::runtime_error("Invalid heartbeat time");
             if (reader.online.load(std::memory_order_acquire) &&
                 (now - reader.heartbeat.load(std::memory_order_acquire)) > HEARTBEAT_TIMEOUT) {
                 // 标记为离线
@@ -477,46 +472,13 @@ private:
     }
 
     // 无锁分配块（pop可用块栈）
-    bool alloc_block(size_t& block_id) {
-        size_t current_top = meta_->free_block_top.load(std::memory_order_acquire);
-        while (current_top > 0) {
-            size_t new_top = current_top - 1;
-            block_id = meta_->free_blocks[new_top];
-
-            // CAS更新栈顶：成功则分配块，失败则重试
-            if (meta_->free_block_top.compare_exchange_weak(
-                current_top, new_top,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-                return true;
-            }
-            // current_top被其他进程修改，重新加载
-            current_top = meta_->free_block_top.load(std::memory_order_acquire);
-        }
-        return false;  // 无空闲块
+    bool alloc_block(uint32_t& block_id) {
+        return meta_->free_list.pop(block_id);
     }
 
     // 无锁释放块（push到可用块栈）
-    void free_block(size_t block_id) {
-        if (block_id >= BLOCK_COUNT) return;
-
-        size_t current_top = meta_->free_block_top.load(std::memory_order_acquire);
-        while (current_top < BLOCK_COUNT) {
-            meta_->free_blocks[current_top] = block_id;
-            size_t new_top = current_top + 1;
-
-            // CAS更新栈顶：成功则释放块，失败则重试
-            if (meta_->free_block_top.compare_exchange_weak(
-                current_top, new_top,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-                return;
-            }
-            // current_top被其他进程修改，重新加载
-            current_top = meta_->free_block_top.load(std::memory_order_acquire);
-        }
-        // 块已满（理论上不会发生，因块数量固定）
-        std::cerr << "Free block stack overflow" << std::endl;
+    bool free_block(size_t block_id) {
+        return meta_->free_list.push(block_id);
     }
 
     // 回收已完成发布且队列无引用的块
@@ -544,7 +506,7 @@ private:
 
     // 获取当前时间戳（毫秒）
     static uint64_t get_timestamp_ms() {
-        auto now = std::chrono::system_clock::now().time_since_epoch();
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
         return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
     }
 

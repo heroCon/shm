@@ -9,7 +9,7 @@
 
 // 无锁自由列表：MPMC支持，管理固定容量的索引分配/回收
 // IndexType：索引类型（必须是无符号整数，默认uint32_t）
-template <typename IndexType = uint32_t>
+template <typename IndexType = uint32_t, size_t CAPACITY = 32>
 class LockFreeFreeList {
 private:
     // 链表头节点：索引+版本号（解决ABA问题）
@@ -17,9 +17,10 @@ private:
         IndexType next_free_index; // 指向链表下一个空闲索引
         uint64_t aba_counter;      // 版本号，每次修改递增
     };
+// 暂定直接使用数组，不能使用指针，因为指针在第一个进程初始化后的地址在第二个进程中无法访问
 
     std::atomic<Node> m_head;                // 原子化链表头（索引+版本号）
-    IndexType* m_next_free_index;            // 空闲索引链表存储（外部传入，固定长度）
+    IndexType m_next_free_index[CAPACITY];            // 空闲索引链表存储（外部传入，固定长度）
     IndexType m_size;                        // 最大容量（支持的有效索引：0 ~ m_size-1）
     IndexType m_invalid_index;               // 无效索引标记（标记已分配的索引）
     std::atomic<bool> m_is_initialized{false};// 初始化状态标记
@@ -29,44 +30,20 @@ private:
                   "IndexType must be an unsigned integer type");
 
 public:
-    // 构造函数：默认未初始化，需调用init()完成初始化
-    LockFreeFreeList() noexcept 
-        : m_head({0, 0}), m_next_free_index(nullptr), m_size(0), m_invalid_index(0) {}
-
-    // 禁止拷贝和移动（无锁结构拷贝风险高，避免误用）
-    LockFreeFreeList(const LockFreeFreeList&) = delete;
-    LockFreeFreeList& operator=(const LockFreeFreeList&) = delete;
-    LockFreeFreeList(LockFreeFreeList&&) = delete;
-    LockFreeFreeList& operator=(LockFreeFreeList&&) = delete;
-
-    // 析构函数：不管理外部传入的m_next_free_index内存（由用户负责）
-    ~LockFreeFreeList() noexcept {
-        m_is_initialized.store(false, std::memory_order_relaxed);
-    }
-
-    // 初始化：传入外部索引存储缓冲区和容量
-    // 注意：buffer需保证生命周期长于自由列表，且容量>0
-    void init(IndexType* buffer, IndexType capacity) {
-        if (buffer == nullptr) {
-            throw std::invalid_argument("Buffer cannot be null!");
-        }
-        if (capacity == 0) {
-            throw std::invalid_argument("Capacity must be greater than 0!");
-        }
+    void init() {
         if (m_is_initialized.load(std::memory_order_acquire)) {
             throw std::logic_error("Free list has already been initialized!");
         }
 
-        m_next_free_index = buffer;
-        m_size = capacity;
-        m_invalid_index = capacity + 1; // 无效索引 = 容量+1（超出有效索引范围）
+        m_size = CAPACITY;
+        m_invalid_index = m_size + 1; // 无效索引 = 容量+1（超出有效索引范围）
 
         // 初始化空闲链表：buffer[i] = i+1（形成 0→1→2→...→capacity 的连续链表）
-        for (IndexType i = 0; i < capacity; ++i) {
+        for (IndexType i = 0; i < m_size; ++i) {
             m_next_free_index[i] = i + 1;
         }
         // 链表尾节点指向无效索引（标记链表结束）
-        m_next_free_index[capacity] = m_invalid_index;
+        m_next_free_index[m_size] = m_invalid_index;
 
         // 初始化链表头：指向第一个空闲索引（0），版本号0
         m_head.store({0, 0}, std::memory_order_release);
@@ -102,6 +79,7 @@ public:
 
         // 传出分配的索引（原头指向的空闲索引）
         index = old_head.next_free_index;
+        std::cout << "Allocated index: " << index << std::endl;
         // 标记该索引为已分配（避免double free）
         m_next_free_index[index] = m_invalid_index;
 
@@ -113,6 +91,7 @@ public:
 
     // 回收索引（push）：成功返回true，失败（索引无效/重复回收/未初始化）返回false
     bool push(const IndexType index) noexcept {
+        std::cout << "Pushing index: " << index << std::endl;
         // 未初始化直接返回失败
         if (!m_is_initialized.load(std::memory_order_acquire)) {
             return false;
@@ -162,5 +141,14 @@ public:
             return true;
         }
         return m_head.load(std::memory_order_acquire).next_free_index >= m_size;
+    }
+
+    // 辅助接口：检查内存分配
+    void print_list() const{
+        Node head = m_head.load(std::memory_order_acquire);
+        std::cout << "m_head: " << head.aba_counter << "," << head.next_free_index << std::endl;
+        for (IndexType i = 0; i < m_size; ++i) {
+            std::cout << "buffer[" << i << "]: " << m_next_free_index[i] << std::endl;
+        }
     }
 };

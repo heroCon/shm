@@ -1,21 +1,22 @@
 #include "shm_pubsub.h"
 #include <thread>
 
+#include "TestTopic.h"
+#include "DelayTime.h"
+
 int main() {
     ShmPubSub pub(ShmPubSub::PUBLISHER);
-    std::string msg = "Hello PubSub! Count: ";
-    size_t count = 0;
+    TestTopic *msg = new TestTopic;
 
-    // 每隔1秒发布一条数据
+    uint64_t count = 0;
     while (true) {
-        std::string data = msg + std::to_string(count++);
-        bool ret = pub.publish(data.c_str(), data.size());
-        if (ret) {
-            std::cout << "Publisher " << getpid() << " published: " << data << std::endl;
-        } else {
-            std::cerr << "Publisher " << getpid() << " publish failed" << std::endl;
+        msg->timestamp = count++;//DelayTime::get_time();
+        bool ret = pub.publish(msg, sizeof(TestTopic));
+        std::cout << "publish " << count << std::endl;
+        if (!ret) {
+            std::cerr << "publish failed" << std::endl;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     return 0;
