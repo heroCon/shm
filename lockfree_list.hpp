@@ -30,20 +30,35 @@ private:
                   "IndexType must be an unsigned integer type");
 
 public:
+    // 轻量一致性检查：用于判断共享内存中的 free_list 是否可能来自旧版本/被破坏
+    bool is_sane() const noexcept {
+        if (!m_is_initialized.load(std::memory_order_acquire)) {
+            return true;
+        }
+        return m_size == CAPACITY && m_invalid_index == CAPACITY + 1;
+    }
+
+    // 强制重置初始化标记（仅应在确认没有并发使用者时调用）
+    void force_reset_for_reinit() noexcept {
+        m_is_initialized.store(false, std::memory_order_release);
+    }
+
     void init() {
         if (m_is_initialized.load(std::memory_order_acquire)) {
             throw std::logic_error("Free list has already been initialized!");
         }
 
         m_size = CAPACITY;
-        m_invalid_index = m_size + 1; // 无效索引 = 容量+1（超出有效索引范围）
+        // m_next_free_index 用于“空闲链表 next”，链表结束用 m_size（CAPACITY）作为哨兵；
+        // 而“已分配标记”必须与链表结束哨兵区分开，否则尾节点会被误判为已分配/可重复回收。
+        m_invalid_index = static_cast<IndexType>(m_size + 1);
 
-        // 初始化空闲链表：buffer[i] = i+1（形成 0→1→2→...→capacity 的连续链表）
-        for (IndexType i = 0; i < m_size; ++i) {
-            m_next_free_index[i] = i + 1;
+        // 初始化空闲链表：0→1→2→...→(m_size-1)→invalid
+        // 注意：m_next_free_index 只有 CAPACITY 个元素（0..m_size-1），不能写入 m_size
+        for (IndexType i = 0; i + 1 < m_size; ++i) {
+            m_next_free_index[i] = static_cast<IndexType>(i + 1);
         }
-        // 链表尾节点指向无效索引（标记链表结束）
-        m_next_free_index[m_size] = m_invalid_index;
+        m_next_free_index[m_size - 1] = static_cast<IndexType>(m_size); // end-of-list sentinel
 
         // 初始化链表头：指向第一个空闲索引（0），版本号0
         m_head.store({0, 0}, std::memory_order_release);

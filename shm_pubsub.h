@@ -8,6 +8,8 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <cerrno>
+#include <new>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -27,6 +29,8 @@ constexpr size_t QUEUE_CAPACITY = 32;                    // 每个读进程接�
 constexpr uint64_t HEARTBEAT_TIMEOUT = 5000;             // 进程心跳超时（5秒）
 constexpr uint64_t HEARTBEAT_INTERVAL = 1000;            // 心跳更新间隔（1秒）
 constexpr uint64_t RECYCLE_INTERVAL = 2000;               // 资源回收间隔（2秒）
+constexpr uint32_t SHM_MAGIC = 0x53484D50;               // 'SHMP'
+constexpr uint32_t SHM_ABI_VERSION = 2;                  // bump when SharedMeta layout changes
 // -----------------------------------------------------------------------------
 
 // 无锁循环队列（每个读进程专属接收队列，存储数据块ID）
@@ -34,27 +38,29 @@ struct AtomicQueue {
     std::atomic<size_t> head = {0};  // 出队指针（读）
     std::atomic<size_t> tail = {0};  // 入队指针（写）
     size_t queue[QUEUE_CAPACITY] = {0};  // 存储块ID
+    std::atomic<uint8_t> ready[QUEUE_CAPACITY] = {}; // slot 就绪标记：避免读到未写入的 queue 槽位
 
-    // 入队（无锁，队列满则丢弃旧数据）
+    // 入队（无锁；队列满则返回 false，由上层决定如何处理避免泄漏）
     bool enqueue(size_t block_id) {
-        size_t current_tail = tail.load(std::memory_order_acquire);
-        size_t next_tail = (current_tail + 1) % QUEUE_CAPACITY;
+        for (;;) {
+            size_t current_tail = tail.load(std::memory_order_acquire);
+            size_t next_tail = (current_tail + 1) % QUEUE_CAPACITY;
 
-        // 队列满：直接覆盖旧数据（或返回false，根据需求调整）
-        if (next_tail == head.load(std::memory_order_acquire)) {
-            queue[current_tail] = block_id;  // 覆盖队尾
-            return true;
-        }
+            // 队列满：返回失败（避免无声覆盖导致块 ID 丢失/泄漏）
+            if (next_tail == head.load(std::memory_order_acquire)) {
+                return false;
+            }
 
-        // CAS更新tail：确保原子性
-        if (tail.compare_exchange_weak(
-            current_tail, next_tail,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed)) {
-            queue[current_tail] = block_id;
-            return true;
+            // 先通过 CAS 预留一个槽位；消费者可能会先看到 tail 变化，所以需要 ready 标记保护
+            if (tail.compare_exchange_weak(
+                    current_tail, next_tail,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                queue[current_tail] = block_id;
+                ready[current_tail].store(1, std::memory_order_release);
+                return true;
+            }
         }
-        return false;  // 并发冲突，重试后仍失败（概率极低）
     }
 
     // 出队（无锁）
@@ -64,18 +70,23 @@ struct AtomicQueue {
             return false;  // 队列为空
         }
 
-        size_t next_head = (current_head + 1) % QUEUE_CAPACITY;
-        block_id = queue[current_head];
-
-        // CAS更新head：确保原子性
-        if (head.compare_exchange_weak(
-            current_head, next_head,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed)) {
-            return true;
+        // 生产者可能已推进 tail 但尚未写入 queue 槽位，ready 用于避免读到旧值
+        if (!ready[current_head].load(std::memory_order_acquire)) {
+            return false;
         }
-        throw std::runtime_error("[ShmPubSub] dequeue failed");
-        return false;  // 并发冲突，重试后仍失败
+
+        size_t next_head = (current_head + 1) % QUEUE_CAPACITY;
+        // CAS更新head：确保原子性（单消费者场景下基本不会失败）
+        if (!head.compare_exchange_weak(
+                current_head, next_head,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return false;
+        }
+
+        block_id = queue[current_head];
+        ready[current_head].store(0, std::memory_order_release);
+        return true;
     }
     
     // 检查队列中是否包含指定块ID
@@ -83,7 +94,7 @@ struct AtomicQueue {
         size_t head = this->head.load(std::memory_order_acquire);
         size_t tail = this->tail.load(std::memory_order_acquire);
         for (size_t i = head; i != tail; i = (i + 1) % QUEUE_CAPACITY) {
-            if (queue[i] == block_id) {
+            if (ready[i].load(std::memory_order_acquire) && queue[i] == block_id) {
                 return true;
             }
         }
@@ -92,6 +103,9 @@ struct AtomicQueue {
 
     // 清空队列（用于进程离线回收）
     void clear() {
+        for (size_t i = 0; i < QUEUE_CAPACITY; ++i) {
+            ready[i].store(0, std::memory_order_release);
+        }
         head.store(0, std::memory_order_release);
         tail.store(0, std::memory_order_release);
     }
@@ -123,6 +137,8 @@ struct WriterInfo {
 
 // 共享内存元数据（整个共享内存的核心控制结构）
 struct SharedMeta {
+    uint32_t magic = 0;
+    uint32_t abi_version = 0;
     std::atomic<bool> inited = {false};                          // 初始化标记
     size_t block_count = BLOCK_COUNT;                            // 数据块总数
     size_t block_size = BLOCK_SIZE;                              // 单个块大小
@@ -189,11 +205,15 @@ public:
         for (size_t i = 0; i < MAX_READERS; ++i) {
             ReaderInfo& reader = meta_->readers[i];
             if (reader.online.load(std::memory_order_acquire) && reader.subscribed) {
-                if(reader.recv_queue.enqueue(block_id) == false)
-                    throw std::runtime_error("enqueue failed");
+                if (!reader.recv_queue.enqueue(block_id)) {
+                    // 该订阅者未能入队，释放一次引用，避免 ref_count 永久无法归零导致泄漏
+                    release_block_ref(block_id);
+                }
             }
         }
 
+        // 如果没有任何订阅者成功入队（例如队列满），此处选择“丢弃但不报错”，保持发布端非阻塞特性。
+        // 相关块已在 release_block_ref 中归还 free_list，不会造成泄漏或耗尽。
         return true;
     }
 
@@ -248,6 +268,10 @@ public:
         if (block->owner_pid.load(std::memory_order_acquire) != 0) {
             std::cout << "Subscriber " << getpid() << " skip incomplete block (ID: " << block_id << ")" << std::endl;
             actual_len = 0;
+            // 避免丢失块 ID：尝试重新入队；若失败则释放引用避免泄漏
+            if (!reader_info_->recv_queue.enqueue(block_id)) {
+                release_block_ref(block_id);
+            }
             return false;
         }
 
@@ -255,12 +279,28 @@ public:
         actual_len = std::min(block->data_len, buf_len);
         memcpy(buf, block->data, actual_len);
 
-        // 消费后直接回收块（原子无锁，不会冲突）
-        free_block(block_id);
+        // 消费后释放引用：仅最后一个消费者归还块
+        release_block_ref(block_id);
         return true;
     }
 
 private:
+    void release_block_ref(size_t block_id) {
+        DataBlock* block = &blocks_[block_id];
+        size_t current_ref = block->ref_count.load(std::memory_order_acquire);
+        while (current_ref > 0) {
+            if (block->ref_count.compare_exchange_weak(
+                    current_ref, current_ref - 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                if (current_ref - 1 == 0) {
+                    free_block(block_id);
+                }
+                return;
+            }
+        }
+    }
+
     // 初始化共享内存
     void init_shm() {
         // 1. 计算共享内存总大小：元数据大小 + 所有数据块大小
@@ -290,6 +330,37 @@ private:
         meta_ = static_cast<SharedMeta*>(shm_ptr_);
         blocks_ = reinterpret_cast<DataBlock*>(reinterpret_cast<char*>(shm_ptr_) + sizeof(SharedMeta));
 
+        // 5.0 ABI 检查：SharedMeta/队列布局升级后，如果复用旧共享内存会产生错误行为
+        if (meta_->magic != SHM_MAGIC || meta_->abi_version != SHM_ABI_VERSION) {
+            // 仅示例工程：发现不兼容时直接重建元数据，避免继续使用旧布局造成崩溃/泄漏。
+            // 如果需要在生产环境中支持滚动升级，应使用更严格的多版本兼容策略。
+            new (meta_) SharedMeta();
+            meta_->magic = SHM_MAGIC;
+            meta_->abi_version = SHM_ABI_VERSION;
+            meta_->inited.store(false, std::memory_order_release);
+            meta_->block_count = BLOCK_COUNT;
+            meta_->block_size = BLOCK_SIZE;
+        }
+
+        // 5.1 清理可能残留的注册信息（异常退出时 online 标记可能遗留在共享内存中）
+        // 只做“pid 不存在则离线”的保守回收，避免影响仍在运行的进程。
+        for (size_t i = 0; i < MAX_WRITERS; ++i) {
+            WriterInfo& w = meta_->writers[i];
+            if (w.online.load(std::memory_order_acquire) && !pid_alive(w.pid)) {
+                w.online.store(false, std::memory_order_release);
+            }
+        }
+        for (size_t i = 0; i < MAX_READERS; ++i) {
+            ReaderInfo& r = meta_->readers[i];
+            if (r.online.load(std::memory_order_acquire) && !pid_alive(r.pid)) {
+                r.online.store(false, std::memory_order_release);
+                r.subscribed = false;
+                r.recv_queue.clear();
+            }
+        }
+
+        const bool any_online = has_any_online_process();
+
         // 6. 初始化共享内存（仅第一个进程执行）
         if (!meta_->inited.load(std::memory_order_acquire)) {
             bool expected = false;  // 关键：用普通变量存储预期值
@@ -300,7 +371,40 @@ private:
                 meta_->free_list.init();
             }
         }
+
+        // 如果共享内存残留了“inited=true 但 free_list 未完成初始化”的状态（例如初始化进程异常退出），
+        // 且当前确认没有存活进程，则直接完成初始化以避免永久等待。
+        if (!any_online && !meta_->free_list.is_initialized()) {
+            meta_->free_list.init();
+        }
+
+        // 兼容旧版本/异常退出导致的 free_list 破坏：当确认没有存活进程时，允许重置并重新初始化
+        if (!any_online && meta_->free_list.is_initialized() && !meta_->free_list.is_sane()) {
+            meta_->free_list.force_reset_for_reinit();
+            meta_->free_list.init();
+        }
+
+        // 其他进程可能在 meta_->inited 变为 true 之后才进入，此时 free_list 仍可能初始化中
+        while (!meta_->free_list.is_initialized()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         meta_->free_list.print_list();
+    }
+
+    static bool pid_alive(pid_t pid) noexcept {
+        if (pid <= 0) return false;
+        if (kill(pid, 0) == 0) return true;
+        return errno == EPERM;
+    }
+
+    bool has_any_online_process() const noexcept {
+        for (size_t i = 0; i < MAX_WRITERS; ++i) {
+            if (meta_->writers[i].online.load(std::memory_order_acquire)) return true;
+        }
+        for (size_t i = 0; i < MAX_READERS; ++i) {
+            if (meta_->readers[i].online.load(std::memory_order_acquire)) return true;
+        }
+        return false;
     }
 
     // 注册当前进程到共享内存元数据
