@@ -29,71 +29,77 @@ constexpr uint64_t HEARTBEAT_INTERVAL = 1000;            // 心跳更新间隔�
 constexpr uint64_t RECYCLE_INTERVAL = 2000;               // 资源回收间隔（2秒）
 // -----------------------------------------------------------------------------
 
-// 无锁循环队列（每个读进程专属接收队列，存储数据块ID）
+// 每个读进程专属接收队列，存储数据块ID
 struct AtomicQueue {
     std::atomic<size_t> head = {0};  // 出队指针（读）
     std::atomic<size_t> tail = {0};  // 入队指针（写）
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;  // 保护队列槽位和指针更新
     size_t queue[QUEUE_CAPACITY] = {0};  // 存储块ID
 
-    // 入队（无锁，队列满则丢弃旧数据）
-    bool enqueue(size_t block_id) {
-        size_t current_tail = tail.load(std::memory_order_acquire);
-        size_t next_tail = (current_tail + 1) % QUEUE_CAPACITY;
-
-        // 队列满：直接覆盖旧数据（或返回false，根据需求调整）
-        if (next_tail == head.load(std::memory_order_acquire)) {
-            queue[current_tail] = block_id;  // 覆盖队尾
-            return true;
+    void lock_queue() {
+        while (lock.test_and_set(std::memory_order_acquire)) {
+            std::this_thread::yield();
         }
-
-        // CAS更新tail：确保原子性
-        if (tail.compare_exchange_weak(
-            current_tail, next_tail,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed)) {
-            queue[current_tail] = block_id;
-            return true;
-        }
-        return false;  // 并发冲突，重试后仍失败（概率极低）
     }
 
-    // 出队（无锁）
+    void unlock_queue() {
+        lock.clear(std::memory_order_release);
+    }
+
+    // 入队；队列满时返回false，由发布者负责修正引用计数/回收块
+    bool enqueue(size_t block_id) {
+        lock_queue();
+
+        size_t current_tail = tail.load(std::memory_order_relaxed);
+        size_t next_tail = (current_tail + 1) % QUEUE_CAPACITY;
+        if (next_tail == head.load(std::memory_order_relaxed)) {
+            unlock_queue();
+            return false;
+        }
+
+        queue[current_tail] = block_id;
+        tail.store(next_tail, std::memory_order_release);
+        unlock_queue();
+        return true;
+    }
+
+    // 出队
     bool dequeue(size_t& block_id) {
-        size_t current_head = head.load(std::memory_order_acquire);
+        lock_queue();
+
+        size_t current_head = head.load(std::memory_order_relaxed);
         if (current_head == tail.load(std::memory_order_acquire)) {
-            return false;  // 队列为空
+            unlock_queue();
+            return false;
         }
 
-        size_t next_head = (current_head + 1) % QUEUE_CAPACITY;
         block_id = queue[current_head];
-
-        // CAS更新head：确保原子性
-        if (head.compare_exchange_weak(
-            current_head, next_head,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed)) {
-            return true;
-        }
-        throw std::runtime_error("[ShmPubSub] dequeue failed");
-        return false;  // 并发冲突，重试后仍失败
+        head.store((current_head + 1) % QUEUE_CAPACITY, std::memory_order_release);
+        unlock_queue();
+        return true;
     }
     
     // 检查队列中是否包含指定块ID
     bool contains(size_t block_id) {
-        size_t head = this->head.load(std::memory_order_acquire);
-        size_t tail = this->tail.load(std::memory_order_acquire);
-        for (size_t i = head; i != tail; i = (i + 1) % QUEUE_CAPACITY) {
+        lock_queue();
+        size_t current_head = head.load(std::memory_order_relaxed);
+        size_t current_tail = tail.load(std::memory_order_relaxed);
+        for (size_t i = current_head; i != current_tail; i = (i + 1) % QUEUE_CAPACITY) {
             if (queue[i] == block_id) {
+                unlock_queue();
                 return true;
             }
         }
+        unlock_queue();
         return false;
     }
 
     // 清空队列（用于进程离线回收）
     void clear() {
+        lock_queue();
         head.store(0, std::memory_order_release);
         tail.store(0, std::memory_order_release);
+        unlock_queue();
     }
 };
 
@@ -146,14 +152,15 @@ public:
 
     // 析构函数：注销进程，释放资源
     ~ShmPubSub() {
-        unregister_process();
-        release_shm();
+        running_.store(false, std::memory_order_release);
         if (heartbeat_thread_.joinable()) {
             heartbeat_thread_.join();
         }
         if (recycle_thread_.joinable()) {
             recycle_thread_.join();
         }
+        unregister_process();
+        release_shm();
     }
 
     // 发布数据（写进程调用）
@@ -175,26 +182,33 @@ public:
             return false;
         }
 
-        // 3. 写入数据到块（初始化引用计数=订阅者数量）
+        // 3. 写入数据到块；发布者先持有一个临时引用，避免投递过程中被订阅者提前回收
         DataBlock* block = &blocks_[block_id];
         block->owner_pid.store(getpid(), std::memory_order_release);
-        block->ref_count.store(sub_count, std::memory_order_release);  // 关键：初始化引用计数
+        block->ref_count.store(1, std::memory_order_release);
         block->data_len = std::min(data_len, sizeof(block->data));
         memcpy(block->data, data, block->data_len);
 
-        // 4. 发布者释放块所有权（不再直接归还块，由引用计数控制）
+        // 4. 数据写完后释放所有权；之后入队的订阅者只能看到完整块
         block->owner_pid.store(0, std::memory_order_release);
 
-        // 5. 遍历所有订阅者，将块ID入队到其接收队列（无锁）
+        // 5. 遍历所有订阅者，将块ID入队到其接收队列；只为成功入队保留引用
+        size_t enqueued_count = 0;
         for (size_t i = 0; i < MAX_READERS; ++i) {
             ReaderInfo& reader = meta_->readers[i];
             if (reader.online.load(std::memory_order_acquire) && reader.subscribed) {
-                if(reader.recv_queue.enqueue(block_id) == false)
-                    throw std::runtime_error("enqueue failed");
+                block->ref_count.fetch_add(1, std::memory_order_acq_rel);
+                if (reader.recv_queue.enqueue(block_id)) {
+                    ++enqueued_count;
+                } else {
+                    release_block_ref(block_id);
+                    std::cerr << "Subscriber queue full, skip subscriber (ID: " << i << ")" << std::endl;
+                }
             }
         }
 
-        return true;
+        release_block_ref(block_id);  // 释放发布者临时引用
+        return enqueued_count > 0;
     }
 
     // 新增：获取当前有效订阅者数量（在线且已订阅）
@@ -226,7 +240,7 @@ public:
         return true;
     }
 
-    // 接收数据（完全按你的要求：owner≠0直接return，owner=0消费后回收）
+    // 接收数据：owner≠0直接return；owner=0消费后按引用计数回收
     bool receive(void* buf, size_t buf_len, size_t& actual_len) {
         if (role_ != SUBSCRIBER || !reader_info_ || !buf) return false;
 
@@ -255,8 +269,8 @@ public:
         actual_len = std::min(block->data_len, buf_len);
         memcpy(buf, block->data, actual_len);
 
-        // 消费后直接回收块（原子无锁，不会冲突）
-        free_block(block_id);
+        // 消费后递减引用计数；最后一个订阅者消费后才回收块
+        release_block_ref(block_id);
         return true;
     }
 
@@ -467,6 +481,23 @@ private:
                     }
                 }
                 reader.recv_queue.clear();  // 清空队列
+            }
+        }
+    }
+
+
+    void release_block_ref(size_t block_id) {
+        DataBlock* block = &blocks_[block_id];
+        size_t current_ref = block->ref_count.load(std::memory_order_acquire);
+        while (current_ref > 0) {
+            if (block->ref_count.compare_exchange_weak(
+                current_ref, current_ref - 1,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+                if (current_ref - 1 == 0) {
+                    free_block(block_id);
+                }
+                return;
             }
         }
     }

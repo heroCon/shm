@@ -20,7 +20,7 @@ private:
 // 暂定直接使用数组，不能使用指针，因为指针在第一个进程初始化后的地址在第二个进程中无法访问
 
     std::atomic<Node> m_head;                // 原子化链表头（索引+版本号）
-    IndexType m_next_free_index[CAPACITY];            // 空闲索引链表存储（外部传入，固定长度）
+    IndexType m_next_free_index[CAPACITY + 1];        // 空闲索引链表存储（包含一个尾哨兵槽位）
     IndexType m_size;                        // 最大容量（支持的有效索引：0 ~ m_size-1）
     IndexType m_invalid_index;               // 无效索引标记（标记已分配的索引）
     std::atomic<bool> m_is_initialized{false};// 初始化状态标记
@@ -38,7 +38,7 @@ public:
         m_size = CAPACITY;
         m_invalid_index = m_size + 1; // 无效索引 = 容量+1（超出有效索引范围）
 
-        // 初始化空闲链表：buffer[i] = i+1（形成 0→1→2→...→capacity 的连续链表）
+        // 初始化空闲链表：buffer[i] = i+1（形成 0→1→2→...→capacity-1 的连续链表）
         for (IndexType i = 0; i < m_size; ++i) {
             m_next_free_index[i] = i + 1;
         }
