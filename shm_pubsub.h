@@ -29,77 +29,102 @@ constexpr uint64_t HEARTBEAT_INTERVAL = 1000;            // 心跳更新间隔�
 constexpr uint64_t RECYCLE_INTERVAL = 2000;               // 资源回收间隔（2秒）
 // -----------------------------------------------------------------------------
 
-// 每个读进程专属接收队列，存储数据块ID
+// Dmitry Vyukov 有界 MPMC 队列（每个读进程专属接收队列，存储数据块ID）
 struct AtomicQueue {
-    std::atomic<size_t> head = {0};  // 出队指针（读）
-    std::atomic<size_t> tail = {0};  // 入队指针（写）
-    std::atomic_flag lock = ATOMIC_FLAG_INIT;  // 保护队列槽位和指针更新
-    size_t queue[QUEUE_CAPACITY] = {0};  // 存储块ID
+    static_assert((QUEUE_CAPACITY & (QUEUE_CAPACITY - 1)) == 0,
+                  "QUEUE_CAPACITY must be a power of two");
 
-    void lock_queue() {
-        while (lock.test_and_set(std::memory_order_acquire)) {
-            std::this_thread::yield();
+    struct Cell {
+        std::atomic<size_t> sequence = {0};
+        size_t data = 0;
+    };
+
+    Cell queue[QUEUE_CAPACITY];
+    std::atomic<size_t> enqueue_pos = {0};
+    std::atomic<size_t> dequeue_pos = {0};
+
+    void init() {
+        enqueue_pos.store(0, std::memory_order_relaxed);
+        dequeue_pos.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < QUEUE_CAPACITY; ++i) {
+            queue[i].sequence.store(i, std::memory_order_relaxed);
+            queue[i].data = 0;
         }
-    }
-
-    void unlock_queue() {
-        lock.clear(std::memory_order_release);
     }
 
     // 入队；队列满时返回false，由发布者负责修正引用计数/回收块
     bool enqueue(size_t block_id) {
-        lock_queue();
+        Cell* cell = nullptr;
+        size_t pos = enqueue_pos.load(std::memory_order_relaxed);
 
-        size_t current_tail = tail.load(std::memory_order_relaxed);
-        size_t next_tail = (current_tail + 1) % QUEUE_CAPACITY;
-        if (next_tail == head.load(std::memory_order_relaxed)) {
-            unlock_queue();
-            return false;
+        for (;;) {
+            cell = &queue[pos & (QUEUE_CAPACITY - 1)];
+            size_t seq = cell->sequence.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+            if (diff == 0) {
+                if (enqueue_pos.compare_exchange_weak(
+                    pos, pos + 1,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return false;
+            } else {
+                pos = enqueue_pos.load(std::memory_order_relaxed);
+            }
         }
 
-        queue[current_tail] = block_id;
-        tail.store(next_tail, std::memory_order_release);
-        unlock_queue();
+        cell->data = block_id;
+        cell->sequence.store(pos + 1, std::memory_order_release);
         return true;
     }
 
     // 出队
     bool dequeue(size_t& block_id) {
-        lock_queue();
+        Cell* cell = nullptr;
+        size_t pos = dequeue_pos.load(std::memory_order_relaxed);
 
-        size_t current_head = head.load(std::memory_order_relaxed);
-        if (current_head == tail.load(std::memory_order_acquire)) {
-            unlock_queue();
-            return false;
+        for (;;) {
+            cell = &queue[pos & (QUEUE_CAPACITY - 1)];
+            size_t seq = cell->sequence.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+            if (diff == 0) {
+                if (dequeue_pos.compare_exchange_weak(
+                    pos, pos + 1,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return false;
+            } else {
+                pos = dequeue_pos.load(std::memory_order_relaxed);
+            }
         }
 
-        block_id = queue[current_head];
-        head.store((current_head + 1) % QUEUE_CAPACITY, std::memory_order_release);
-        unlock_queue();
+        block_id = cell->data;
+        cell->sequence.store(pos + QUEUE_CAPACITY, std::memory_order_release);
         return true;
     }
     
-    // 检查队列中是否包含指定块ID
-    bool contains(size_t block_id) {
-        lock_queue();
-        size_t current_head = head.load(std::memory_order_relaxed);
-        size_t current_tail = tail.load(std::memory_order_relaxed);
-        for (size_t i = current_head; i != current_tail; i = (i + 1) % QUEUE_CAPACITY) {
-            if (queue[i] == block_id) {
-                unlock_queue();
+    // 检查队列中是否包含指定块ID（弱一致性，仅用于回收路径判断）
+    bool contains(size_t block_id) const {
+        size_t begin = dequeue_pos.load(std::memory_order_acquire);
+        size_t end = enqueue_pos.load(std::memory_order_acquire);
+        for (size_t pos = begin; pos != end; ++pos) {
+            const Cell& cell = queue[pos & (QUEUE_CAPACITY - 1)];
+            if (cell.sequence.load(std::memory_order_acquire) == pos + 1 &&
+                cell.data == block_id) {
                 return true;
             }
         }
-        unlock_queue();
         return false;
     }
 
-    // 清空队列（用于进程离线回收）
+    // 清空队列（用于进程离线回收后重置队列状态）
     void clear() {
-        lock_queue();
-        head.store(0, std::memory_order_release);
-        tail.store(0, std::memory_order_release);
-        unlock_queue();
+        init();
     }
 };
 
@@ -312,6 +337,9 @@ private:
                 std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
                 meta_->free_list.init();
+                for (size_t i = 0; i < MAX_READERS; ++i) {
+                    meta_->readers[i].recv_queue.init();
+                }
             }
         }
         meta_->free_list.print_list();
