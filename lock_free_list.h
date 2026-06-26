@@ -1,5 +1,5 @@
-#ifndef LOCKFREE_LIST_HPP_
-#define LOCKFREE_LIST_HPP_
+#ifndef LOCK_FREE_LIST_H_
+#define LOCK_FREE_LIST_H_
 
 #include <atomic>
 #include <cstddef>
@@ -146,4 +146,4 @@ class LockFreeFreeList {
   }
 };
 
-#endif  // LOCKFREE_LIST_HPP_
+#endif  // LOCK_FREE_LIST_H_

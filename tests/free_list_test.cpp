@@ -1,7 +1,7 @@
 #include <cassert>
 #include <cstdint>
 
-#include "lockfree_list.hpp"
+#include "lock_free_list.h"
 
 int main() {
   LockFreeFreeList<uint32_t, 3> free_list;

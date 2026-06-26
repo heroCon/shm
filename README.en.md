@@ -7,9 +7,9 @@ This repository is a lightweight Linux shared-memory publish/subscribe example. 
 - `publisher`: Publisher process example that continuously sends `TestTopic` messages.
 - `subscriber`: Subscriber process example that polls and receives messages in a non-blocking loop.
 - `shm_pubsub.h`: Core pub/sub implementation (shared memory layout, registration, publish/receive, recycling).
-- `lockfree_list.hpp`: Lock-free free-list used for block allocation/release.
-- `TestTopic.h`: Sample message structure.
-- `DelayTime.h`: Optional delay measurement helper.
+- `lock_free_list.h`: Lock-free free-list used for block allocation/release.
+- `test_topic.h`: Sample message structure.
+- `delay_time.h`: Optional delay measurement helper.
 
 ## Requirements
 

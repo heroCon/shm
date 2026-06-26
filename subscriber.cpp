@@ -3,8 +3,8 @@
 #include <iostream>
 #include <thread>
 
-#include "TestTopic.h"
 #include "shm_pubsub.h"
+#include "test_topic.h"
 
 int main() {
   ShmPubSub sub(ShmPubSub::SUBSCRIBER);

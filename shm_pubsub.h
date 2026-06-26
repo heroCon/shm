@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <thread>
 
-#include "lockfree_list.hpp"
+#include "lock_free_list.h"
 
 // -------------------------- 可配置参数（根据需求调整）--------------------------
 constexpr const char* SHM_NAME = "/shm_pubsub_mq";  // 共享内存名称
