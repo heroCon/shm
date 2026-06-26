@@ -1,6 +1,6 @@
 # lockfree_shm
 
-This repository is a lightweight Linux shared-memory publish/subscribe example. It demonstrates a shared lock-free MPMC message queue, lock-free free-list block management, fixed-size block allocation, heartbeat tracking, and offline resource recycling for multi-process communication.
+This repository is a lightweight Linux shared-memory publish/subscribe example. It demonstrates broadcast and competing-consumer delivery modes, lock-free MPMC message queues, lock-free free-list block management, fixed-size block allocation, heartbeat tracking, and offline resource recycling for multi-process communication.
 
 ## Contents
 
@@ -52,9 +52,19 @@ The subscriber should print continuously increasing timestamps/counters.
 ## Design Summary
 
 - A fixed-size data block pool is stored in shared memory.
-- Publishing allocates one block, writes payload, and enqueues block IDs to the shared reader/writer queue.
-- All publishers and subscribers share one MPMC queue that uses per-slot sequence numbers to keep concurrent producers and consumers consistent.
+- Publishing allocates one block and writes payload; broadcast mode enqueues the block ID to each subscriber queue, while competing-consumer mode enqueues it to the shared queue.
+- Publishers can choose `BROADCAST` or `COMPETING`: the former lets every subscriber receive the same data, while the latter lets subscribers compete for messages from one shared queue.
 - Heartbeat checks detect offline publishers/subscribers and trigger recycling.
+
+
+### Delivery Modes
+
+`ShmPubSub::publish` uses broadcast mode by default, or callers can explicitly request competing-consumer mode:
+
+```cpp
+pub.publish(msg, sizeof(TestTopic), ShmPubSub::BROADCAST);   // every subscriber receives a copy
+pub.publish(msg, sizeof(TestTopic), ShmPubSub::COMPETING);   // one subscriber consumes the message
+```
 
 ## Notes
 

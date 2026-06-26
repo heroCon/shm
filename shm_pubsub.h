@@ -23,13 +23,13 @@ constexpr size_t MAX_WRITERS = 8;                        // 最大写进程数
 constexpr size_t MAX_READERS = 16;                       // 最大读进程数
 constexpr size_t BLOCK_COUNT = 32;                       // 固定数据块数量
 constexpr size_t BLOCK_SIZE = 4096;                      // 单个数据块大小（含长度字段）
-constexpr size_t QUEUE_CAPACITY = 32;                    // 共享消息队列容量
+constexpr size_t QUEUE_CAPACITY = 32;                    // 每个消息队列容量
 constexpr uint64_t HEARTBEAT_TIMEOUT = 5000;             // 进程心跳超时（5秒）
 constexpr uint64_t HEARTBEAT_INTERVAL = 1000;            // 心跳更新间隔（1秒）
 constexpr uint64_t RECYCLE_INTERVAL = 2000;               // 资源回收间隔（2秒）
 // -----------------------------------------------------------------------------
 
-// Dmitry Vyukov 有界 MPMC 队列（读写进程共享，存储数据块ID）
+// Dmitry Vyukov 有界 MPMC 队列（存储数据块ID）
 struct AtomicQueue {
     static_assert((QUEUE_CAPACITY & (QUEUE_CAPACITY - 1)) == 0,
                   "QUEUE_CAPACITY must be a power of two");
@@ -131,7 +131,7 @@ struct AtomicQueue {
 // 数据块结构（POD类型，确保内存布局一致）
 struct DataBlock {
     std::atomic<pid_t> owner_pid = {0};  // 占用进程PID（发布者使用）
-    std::atomic<size_t> ref_count = {0}; // 引用计数：未消费该块的读者数
+    std::atomic<size_t> ref_count = {0}; // 引用计数：队列中未消费的块引用数
     size_t data_len = 0;                 // 实际数据长度
     char data[BLOCK_SIZE - sizeof(owner_pid) - sizeof(ref_count) - sizeof(data_len)] = {0};  // 调整缓冲区大小
 };
@@ -142,6 +142,7 @@ struct ReaderInfo {
     std::atomic<uint64_t> heartbeat = {0};    // 心跳时间戳（毫秒）
     bool subscribed = false;                  // 订阅状态（非原子：仅读进程自身修改）
     pid_t pid = 0;                            // 进程PID
+    AtomicQueue broadcast_queue;              // 广播模式专属接收队列
 };
 
 // 写进程注册信息
@@ -159,13 +160,14 @@ struct SharedMeta {
     LockFreeFreeList<uint32_t, BLOCK_COUNT> free_list;
     WriterInfo writers[MAX_WRITERS] = {0};                       // 写进程数组
     ReaderInfo readers[MAX_READERS] = {0};                       // 读进程数组
-    AtomicQueue msg_queue;                                       // 读写进程共享消息队列
+    AtomicQueue shared_queue;                                    // 竞争消费模式共享消息队列
 };
 
 // 共享内存发布订阅中间件类
 class ShmPubSub {
 public:
     enum Role { PUBLISHER, SUBSCRIBER };
+    enum DeliveryMode { BROADCAST, COMPETING };
 
     // 构造函数：指定角色，初始化共享内存
     ShmPubSub(Role role) : role_(role), shm_fd_(-1), shm_ptr_(nullptr), meta_(nullptr), blocks_(nullptr) {
@@ -189,7 +191,7 @@ public:
     }
 
     // 发布数据（写进程调用）
-    bool publish(const void* data, size_t data_len) {
+    bool publish(const void* data, size_t data_len, DeliveryMode mode = BROADCAST) {
         if (role_ != PUBLISHER) return false;
         if (!data || data_len == 0) return false;
 
@@ -207,7 +209,7 @@ public:
             return false;
         }
 
-        // 3. 写入数据到块；共享队列中每个块只需要一个待消费引用
+        // 3. 写入数据到块；发布者先持有一个临时引用，避免投递过程中被订阅者提前回收
         DataBlock* block = &blocks_[block_id];
         block->owner_pid.store(getpid(), std::memory_order_release);
         block->ref_count.store(1, std::memory_order_release);
@@ -217,14 +219,15 @@ public:
         // 4. 数据写完后释放所有权；之后入队的订阅者只能看到完整块
         block->owner_pid.store(0, std::memory_order_release);
 
-        // 5. 将块ID投递到读写进程共享队列；队列满则归还块
-        if (!meta_->msg_queue.enqueue(block_id)) {
-            release_block_ref(block_id);
-            std::cerr << "Shared message queue full, skip publish" << std::endl;
-            return false;
+        bool enqueued = false;
+        if (mode == COMPETING) {
+            enqueued = publish_competing(block_id);
+        } else {
+            enqueued = publish_broadcast(block_id);
         }
 
-        return true;
+        release_block_ref(block_id);  // 释放发布者临时引用
+        return enqueued;
     }
 
     // 新增：获取当前有效订阅者数量（在线且已订阅）
@@ -256,13 +259,14 @@ public:
         return true;
     }
 
-    // 接收数据：owner≠0直接return；owner=0消费后按引用计数回收
+    // 接收数据：先读广播队列，再读竞争消费队列；消费后按引用计数回收
     bool receive(void* buf, size_t buf_len, size_t& actual_len) {
         if (role_ != SUBSCRIBER || !reader_info_ || !buf) return false;
 
         size_t block_id = 0;
-        // 从读写进程共享队列出队一个块ID
-        if (!meta_->msg_queue.dequeue(block_id)) {
+        // 优先读取广播队列；没有广播消息时再读取竞争消费共享队列
+        if (!reader_info_->broadcast_queue.dequeue(block_id) &&
+            !meta_->shared_queue.dequeue(block_id)) {
             actual_len = 0;
             return false;
         }
@@ -328,7 +332,10 @@ private:
                 std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
                 meta_->free_list.init();
-                meta_->msg_queue.init();
+                meta_->shared_queue.init();
+                for (size_t i = 0; i < MAX_READERS; ++i) {
+                    meta_->readers[i].broadcast_queue.init();
+                }
             }
         }
         meta_->free_list.print_list();
@@ -385,6 +392,7 @@ private:
             writer_info_->online.store(false, std::memory_order_release);
             std::cout << "Publisher " << pid << " unregistered" << std::endl;
         } else if (role_ == SUBSCRIBER && reader_info_) {
+            drain_reader_broadcast_queue(*reader_info_);
             reader_info_->online.store(false, std::memory_order_release);
             reader_info_->subscribed = false;
             std::cout << "Subscriber " << pid << " unregistered" << std::endl;
@@ -446,9 +454,9 @@ private:
                 DataBlock* block = &blocks_[j];
                 if (block->owner_pid.load(std::memory_order_acquire) != w.pid) continue;
 
-                // 检查共享消息队列：是否还有该块？
+                // 检查共享消息队列或广播队列：是否还有该块？
                 if (has_block_in_queues(j)) {
-                    std::cout << "Block " << j << " still in subscribers' queues, wait next cycle" << std::endl;
+                    std::cout << "Block " << j << " still in message queues, wait next cycle" << std::endl;
                     continue;
                 }
 
@@ -479,9 +487,20 @@ private:
                 reader.online.store(false, std::memory_order_release);
                 std::cout << "Recycle offline subscriber (PID: " << reader.pid << ")" << std::endl;
 
-                // 共享队列中的消息不属于某个读进程，离线读进程无需清理队列槽位
+                // 回收该读进程广播队列中的块（递减引用计数，计数为0则归还）
+                drain_reader_broadcast_queue(reader);
             }
         }
+    }
+
+    void drain_reader_broadcast_queue(ReaderInfo& reader) {
+        size_t block_id = 0;
+        while (reader.broadcast_queue.dequeue(block_id)) {
+            if (block_id < BLOCK_COUNT) {
+                release_block_ref(block_id);
+            }
+        }
+        reader.broadcast_queue.clear();
     }
 
 
@@ -523,9 +542,48 @@ private:
         }
     }
 
-    // 检查共享消息队列是否包含该块
+    bool publish_competing(size_t block_id) {
+        DataBlock* block = &blocks_[block_id];
+        block->ref_count.fetch_add(1, std::memory_order_acq_rel);
+        if (meta_->shared_queue.enqueue(block_id)) {
+            return true;
+        }
+        release_block_ref(block_id);
+        std::cerr << "Shared message queue full, skip publish" << std::endl;
+        return false;
+    }
+
+    bool publish_broadcast(size_t block_id) {
+        bool enqueued = false;
+        DataBlock* block = &blocks_[block_id];
+        for (size_t i = 0; i < MAX_READERS; ++i) {
+            ReaderInfo& reader = meta_->readers[i];
+            if (reader.online.load(std::memory_order_acquire) && reader.subscribed) {
+                block->ref_count.fetch_add(1, std::memory_order_acq_rel);
+                if (reader.broadcast_queue.enqueue(block_id)) {
+                    enqueued = true;
+                } else {
+                    release_block_ref(block_id);
+                    std::cerr << "Subscriber broadcast queue full, skip subscriber (ID: " << i << ")" << std::endl;
+                }
+            }
+        }
+        return enqueued;
+    }
+
+    // 检查共享消息队列或广播队列是否包含该块
     bool has_block_in_queues(size_t block_id) {
-        return meta_->msg_queue.contains(block_id);
+        if (meta_->shared_queue.contains(block_id)) {
+            return true;
+        }
+        for (size_t i = 0; i < MAX_READERS; ++i) {
+            ReaderInfo& r = meta_->readers[i];
+            if (r.online.load(std::memory_order_acquire) && r.subscribed &&
+                r.broadcast_queue.contains(block_id)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // 获取当前时间戳（毫秒）
