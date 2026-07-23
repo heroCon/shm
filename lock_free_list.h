@@ -1,3 +1,11 @@
+// Copyright (c) 2019 by Robert Bosch GmbH. All rights reserved.
+// Copyright (c) 2021 - 2022 by Apex.AI Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//
+// This implementation is adapted from iceoryx MpmcLoFFLi.  The caller owns an
+// index after pop() and must transfer that ownership with synchronization before
+// another thread calls push(index).  An index must be pushed exactly once.
+
 #ifndef LOCK_FREE_LIST_H_
 #define LOCK_FREE_LIST_H_
 
@@ -5,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
@@ -28,6 +37,9 @@ class LockFreeFreeList {
 
   // 静态断言：确保索引类型是无符号整数（避免负数索引）
   static_assert(std::is_unsigned<IndexType>::value, "IndexType must be an unsigned integer type");
+  static_assert(CAPACITY > 0, "A capacity of 0 is not supported");
+  static_assert(CAPACITY < std::numeric_limits<IndexType>::max() - 1,
+                "Capacity leaves no room for reserved sentinel indices");
 
  public:
   void init() {
@@ -79,7 +91,6 @@ class LockFreeFreeList {
 
     // 传出分配的索引（原头指向的空闲索引）
     index = old_head.next_free_index;
-    std::cout << "Allocated index: " << index << std::endl;
     // 标记该索引为已分配（避免double free）
     m_next_free_index[index] = m_invalid_index;
 
@@ -91,7 +102,6 @@ class LockFreeFreeList {
 
   // 回收索引（push）：成功返回true，失败（索引无效/重复回收/未初始化）返回false
   bool push(const IndexType index) noexcept {
-    std::cout << "Pushing index: " << index << std::endl;
     // 未初始化直接返回失败
     if (!m_is_initialized.load(std::memory_order_acquire)) {
       return false;
