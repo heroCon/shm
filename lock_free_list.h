@@ -1,14 +1,46 @@
 #ifndef LOCK_FREE_LIST_H_
 #define LOCK_FREE_LIST_H_
 
+// The lock-free free-list algorithm in this file is adapted from iceoryx
+// MpmcLoFFLi.
+//
+// Original copyright:
+//   Copyright (c) 2019 by Robert Bosch GmbH. All rights reserved.
+//   Copyright (c) 2021 - 2022 by Apex.AI Inc. All rights reserved.
+//
+// Original license: Apache-2.0 OR MIT
+//   Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0
+//   MIT:        https://opensource.org/licenses/MIT
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//
+// Source:
+//   https://github.com/eclipse-iceoryx/iceoryx
+//
+// Important correctness contract inherited from iceoryx:
+//   * pop() transfers unique ownership of the returned index to the caller.
+//   * push(index) may only be called by the current unique owner of index.
+//   * If the index ownership is transferred to another thread/process before
+//     push(), that transfer must provide synchronization.
+//   * The invalid-index check in push() is only a defensive check for completed
+//     double frees; it is not a complete protection against concurrent
+//     duplicate push(index) calls or guessed indices.
+//
+// Violating this ownership contract can corrupt the free-list even though the
+// head uses an ABA counter.
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
 #include <stdexcept>
 #include <type_traits>
 
-// 无锁自由列表：MPMC支持，管理固定容量的索引分配/回收
+// 无锁自由列表：MPMC支持，管理固定容量的索引分配/回收。
+// 该实现继承自 iceoryx MpmcLoFFLi 的所有权前提：
+// 1. pop() 返回的索引具有唯一所有权；
+// 2. 只有当前唯一 owner 可以 push(index)；
+// 3. 跨线程/跨进程转移索引所有权时，调用方必须提供同步；
+// 4. push() 中的 invalid-index 检查只能防御已经完成的重复释放，
+//    不能防御两个线程/进程并发 push 同一个 index，也不能防御猜测 index。
 // IndexType：索引类型（必须是无符号整数，默认uint32_t）
 template <typename IndexType = uint32_t, size_t CAPACITY = 32>
 class LockFreeFreeList {
@@ -79,7 +111,6 @@ class LockFreeFreeList {
 
     // 传出分配的索引（原头指向的空闲索引）
     index = old_head.next_free_index;
-    std::cout << "Allocated index: " << index << std::endl;
     // 标记该索引为已分配（避免double free）
     m_next_free_index[index] = m_invalid_index;
 
@@ -91,7 +122,6 @@ class LockFreeFreeList {
 
   // 回收索引（push）：成功返回true，失败（索引无效/重复回收/未初始化）返回false
   bool push(const IndexType index) noexcept {
-    std::cout << "Pushing index: " << index << std::endl;
     // 未初始化直接返回失败
     if (!m_is_initialized.load(std::memory_order_acquire)) {
       return false;
@@ -134,15 +164,6 @@ class LockFreeFreeList {
       return true;
     }
     return m_head.load(std::memory_order_acquire).next_free_index >= m_size;
-  }
-
-  // 辅助接口：检查内存分配
-  void print_list() const {
-    Node head = m_head.load(std::memory_order_acquire);
-    std::cout << "m_head: " << head.aba_counter << "," << head.next_free_index << std::endl;
-    for (IndexType i = 0; i < m_size; ++i) {
-      std::cout << "buffer[" << i << "]: " << m_next_free_index[i] << std::endl;
-    }
   }
 };
 

@@ -336,7 +336,6 @@ class ShmPubSub {
         }
       }
     }
-    meta_->free_list.print_list();
   }
 
   // 注册当前进程到共享内存元数据
@@ -512,14 +511,28 @@ class ShmPubSub {
     }
   }
 
-  // 无锁分配块（pop可用块栈）
+  // 无锁分配块（pop可用块栈）。
+  // LockFreeFreeList 继承自 iceoryx MpmcLoFFLi 的关键前提：
+  // pop() 后 block_id 的唯一所有权必须先由调用方建立，再允许后续 free_block()
+  // 将其归还。publish() 在 pop 后立即设置 owner_pid/ref_count，但在这两次写入
+  // 之间存在短暂窗口；任何基于扫描猜测空闲 block_id 的回收逻辑都不能在该窗口
+  // 调用 free_block()，否则会违反 freelist 的唯一所有权前提。
   bool alloc_block(uint32_t& block_id) { return meta_->free_list.pop(block_id); }
 
-  // 无锁释放块（push到可用块栈）
+  // 无锁释放块（push到可用块栈）。
+  // 只能在调用方已经通过 ref_count/owner_pid 等更高层状态机证明自己是该
+  // block_id 的唯一释放者后调用。freelist 内部的 invalid-index 检查不是
+  // 并发 double-free 的完整防护。
   bool free_block(size_t block_id) { return meta_->free_list.push(block_id); }
 
   // 回收已完成发布且队列无引用的块
   void recycle_unowned_blocks() {
+    // 注意：该扫描式回收逻辑不能在后台周期性启用。
+    // 仅凭 owner_pid == 0 且队列中未找到 block_id，并不能证明当前线程拥有
+    // block_id 的释放权；它可能与 alloc_block() 刚 pop 出 block_id、但 publish()
+    // 尚未写 owner_pid/ref_count 的窗口并发，从而猜中一个已分配但尚未标记的
+    // index 并调用 free_block()。这违反 iceoryx MpmcLoFFLi/LockFreeFreeList 的
+    // 隐含唯一所有权前提。
     for (size_t j = 0; j < BLOCK_COUNT; ++j) {
       DataBlock* block = &blocks_[j];
       // 已完成发布（owner=0）且队列无该块 → 回收
