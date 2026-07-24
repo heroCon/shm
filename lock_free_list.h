@@ -1,3 +1,11 @@
+// Copyright (c) 2019 by Robert Bosch GmbH. All rights reserved.
+// Copyright (c) 2021 - 2022 by Apex.AI Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//
+// This implementation is adapted from iceoryx MpmcLoFFLi.  The caller owns an
+// index after pop() and must transfer that ownership with synchronization before
+// another thread calls push(index).  An index must be pushed exactly once.
+
 #ifndef LOCK_FREE_LIST_H_
 #define LOCK_FREE_LIST_H_
 
@@ -31,6 +39,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
@@ -60,6 +70,9 @@ class LockFreeFreeList {
 
   // 静态断言：确保索引类型是无符号整数（避免负数索引）
   static_assert(std::is_unsigned<IndexType>::value, "IndexType must be an unsigned integer type");
+  static_assert(CAPACITY > 0, "A capacity of 0 is not supported");
+  static_assert(CAPACITY < std::numeric_limits<IndexType>::max() - 1,
+                "Capacity leaves no room for reserved sentinel indices");
 
  public:
   void init() {

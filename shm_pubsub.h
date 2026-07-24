@@ -129,9 +129,11 @@ struct DataBlock {
   std::atomic<pid_t> owner_pid = {0};   // 占用进程PID（发布者使用）
   std::atomic<size_t> ref_count = {0};  // 引用计数：队列中未消费的块引用数
   size_t data_len = 0;                  // 实际数据长度
-  char data[BLOCK_SIZE - sizeof(owner_pid) - sizeof(ref_count) - sizeof(data_len)] = {
-      0};  // 调整缓冲区大小
+  // The preceding fields occupy 24 bytes on the supported Linux ABI: the
+  // atomic<size_t> alignment inserts four bytes after owner_pid.
+  char data[BLOCK_SIZE - 24] = {0};
 };
+static_assert(sizeof(DataBlock) == BLOCK_SIZE, "DataBlock must match BLOCK_SIZE");
 
 // 读进程注册信息
 struct ReaderInfo {
@@ -155,9 +157,9 @@ struct SharedMeta {
   size_t block_count = BLOCK_COUNT;    // 数据块总数
   size_t block_size = BLOCK_SIZE;      // 单个块大小
   LockFreeFreeList<uint32_t, BLOCK_COUNT> free_list;
-  WriterInfo writers[MAX_WRITERS] = {0};  // 写进程数组
-  ReaderInfo readers[MAX_READERS] = {0};  // 读进程数组
-  AtomicQueue shared_queue;               // 竞争消费模式共享消息队列
+  WriterInfo writers[MAX_WRITERS] = {};  // 写进程数组
+  ReaderInfo readers[MAX_READERS] = {};  // 读进程数组
+  AtomicQueue shared_queue;              // 竞争消费模式共享消息队列
 };
 
 // 共享内存发布订阅中间件类
