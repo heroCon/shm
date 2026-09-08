@@ -1,77 +1,34 @@
-# lockfree_shm
+# shm_pubsub
 
-This repository is a lightweight Linux shared-memory publish/subscribe example. It demonstrates broadcast and competing-consumer delivery modes, lock-free MPMC message queues, lock-free free-list block management, fixed-size block allocation, heartbeat tracking, and offline resource recycling for multi-process communication.
+A small **experimental Linux IPC library** providing fixed-size shared-memory messages in broadcast and competing-consumer modes. Version 0.2 makes lifecycle and failure boundaries explicit; it is not durable middleware.
 
-## Contents
-
-- `publisher`: Publisher process example that continuously sends `TestTopic` messages.
-- `subscriber`: Subscriber process example that polls and receives messages in a non-blocking loop.
-- `shm_pubsub.h`: Core pub/sub implementation (shared memory layout, registration, publish/receive, recycling).
-- `lock_free_list.h`: Lock-free free-list used for block allocation/release.
-- `test_topic.h`: Sample message structure.
-- `delay_time.h`: Optional delay measurement helper.
-
-## Requirements
-
-- Linux (POSIX shared memory APIs such as `shm_open` and `mmap`)
-- CMake >= 3.10
-- C++11-compatible compiler or newer
-
-## Build
+## Quick start
 
 ```bash
-mkdir -p build
-cd build
-cmake ..
-make
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+./build/subscriber /demo &
+./build/publisher /demo
 ```
 
-Build outputs:
+The header-only target is `shm_pubsub::shm_pubsub`. Consumers can use `add_subdirectory`, then `target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)`. The optional constructor `Options` configures the POSIX shared-memory name. Call `stop()` for normal shutdown and `ShmPubSub::destroy(name)` only when every participant has detached.
 
-- `build/publisher`
-- `build/subscriber`
+## Architecture
 
-## Run
-
-Use two terminals:
-
-1. Start subscriber
-
-```bash
-./build/subscriber
+```text
+publisher(s) -> fixed block pool -> per-reader MPMC queue -> every broadcast reader
+                             `----> shared MPMC queue -----> one competing reader
 ```
 
-2. Start publisher
+`publish_result` reports no subscribers, full queues, partial broadcast and oversize input. `receive_result` reports empty queues and insufficient buffers. See [exact API semantics](docs/api-semantics.md), [lifecycle/recovery](docs/lifecycle.md), and [lock-free platform contract](docs/lock-free-design.md).
 
-```bash
-./build/publisher
-```
+## Examples and performance
 
-The subscriber should print continuously increasing timestamps/counters.
+`broadcast_example` shows structured publish results; `competing_example` handles real payload bytes. Run `./scripts/run-benchmarks.sh` for shared-memory and Unix-domain-datagram raw CSV baselines; methodology and semantic differences are in [the benchmark guide](docs/benchmark.md).
 
-## Design Summary
+## Support and limitations
 
-- A fixed-size data block pool is stored in shared memory.
-- Publishing allocates one block and writes payload; broadcast mode enqueues the block ID to each subscriber queue, while competing-consumer mode enqueues it to the shared queue.
-- Publishers can choose `BROADCAST` or `COMPETING`: the former lets every subscriber receive the same data, while the latter lets subscribers compete for messages from one shared queue.
-- Heartbeat checks detect offline publishers/subscribers and trigger recycling.
+Supported: Linux, a common ABI across participants, CMake 3.10+, and runtime lock-free required atomics. Messages are at-most-once and best-effort under queue pressure. No persistence, authentication, schema negotiation, publisher-crash allocation journal, or initializer takeover is provided. Heartbeat reclamation assumes processes are scheduled within five seconds. Review [the roadmap](ROADMAP.md), [changelog](CHANGELOG.md), and [contribution guide](CONTRIBUTING.md). Licensed under MIT, with the separately marked free-list under Apache-2.0 OR MIT.
 
-
-### Delivery Modes
-
-`ShmPubSub::publish` uses broadcast mode by default, or callers can explicitly request competing-consumer mode:
-
-```cpp
-pub.publish(msg, sizeof(TestTopic), ShmPubSub::BROADCAST);   // every subscriber receives a copy
-pub.publish(msg, sizeof(TestTopic), ShmPubSub::COMPETING);   // one subscriber consumes the message
-```
-
-## Notes
-
-- This is an experimental/demo implementation focused on mechanism clarity.
-- Shared-memory cleanup is currently simple (includes `shm_unlink` in teardown), which may need refinement for complex multi-process shutdown sequences.
-- Validate behavior under stress and abnormal exits before production use.
-
-## 中文版本
-
-See `README.md`.
+[中文说明](README.md)

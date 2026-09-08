@@ -7,6 +7,12 @@
 
 #include "shm_pubsub.h"
 
+#undef assert
+#define assert(condition)           \
+  do {                              \
+    if (!(condition)) std::abort(); \
+  } while (false)
+
 int main() {
   AtomicQueue queue;
   queue.init();

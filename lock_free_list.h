@@ -57,12 +57,18 @@ class LockFreeFreeList {
  private:
   // 链表头节点：索引+版本号（解决ABA问题）
   struct Node {
-    IndexType next_free_index;  // 指向链表下一个空闲索引
-    uint64_t aba_counter;       // 版本号，每次修改递增
+    uint32_t next_free_index;
+    uint32_t aba_counter;
   };
+  static uint64_t pack(Node n) noexcept {
+    return static_cast<uint64_t>(n.aba_counter) << 32 | n.next_free_index;
+  }
+  static Node unpack(uint64_t value) noexcept {
+    return Node{static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32)};
+  }
   // 暂定直接使用数组，不能使用指针，因为指针在第一个进程初始化后的地址在第二个进程中无法访问
 
-  std::atomic<Node> m_head;                   // 原子化链表头（索引+版本号）
+  std::atomic<uint64_t> m_head;               // packed 32-bit index + 32-bit ABA counter
   IndexType m_next_free_index[CAPACITY + 1];  // 空闲索引链表存储（包含一个尾哨兵槽位）
   IndexType m_size;                           // 最大容量（支持的有效索引：0 ~ m_size-1）
   IndexType m_invalid_index;                  // 无效索引标记（标记已分配的索引）
@@ -70,6 +76,7 @@ class LockFreeFreeList {
 
   // 静态断言：确保索引类型是无符号整数（避免负数索引）
   static_assert(std::is_unsigned<IndexType>::value, "IndexType must be an unsigned integer type");
+  static_assert(sizeof(IndexType) <= sizeof(uint32_t), "packed head supports up to 32-bit indices");
   static_assert(CAPACITY > 0, "A capacity of 0 is not supported");
   static_assert(CAPACITY < std::numeric_limits<IndexType>::max() - 1,
                 "Capacity leaves no room for reserved sentinel indices");
@@ -91,7 +98,7 @@ class LockFreeFreeList {
     m_next_free_index[m_size] = m_invalid_index;
 
     // 初始化链表头：指向第一个空闲索引（0），版本号0
-    m_head.store({0, 0}, std::memory_order_release);
+    m_head.store(pack({0, 0}), std::memory_order_release);
     m_is_initialized.store(true, std::memory_order_release);
   }
 
@@ -102,7 +109,8 @@ class LockFreeFreeList {
       return false;
     }
 
-    Node old_head = m_head.load(std::memory_order_acquire);
+    uint64_t old_value = m_head.load(std::memory_order_acquire);
+    Node old_head = unpack(old_value);
     Node new_head = old_head;
 
     do {
@@ -117,10 +125,11 @@ class LockFreeFreeList {
 
       // CAS原子更新链表头：成功则分配完成，失败则重试（自动更新old_head为最新值）
     } while (!m_head.compare_exchange_weak(
-        old_head, new_head,
-        std::memory_order_acq_rel,  // 成功：写操作释放语义，读操作获取语义
-        std::memory_order_acquire   // 失败：仅读取，获取语义
-        ));
+                 old_value, pack(new_head),
+                 std::memory_order_acq_rel,  // 成功：写操作释放语义，读操作获取语义
+                 std::memory_order_acquire   // 失败：仅读取，获取语义
+                 ) &&
+             (old_head = unpack(old_value), true));
 
     // 传出分配的索引（原头指向的空闲索引）
     index = old_head.next_free_index;
@@ -148,7 +157,8 @@ class LockFreeFreeList {
       return false;
     }
 
-    Node old_head = m_head.load(std::memory_order_acquire);
+    uint64_t old_value = m_head.load(std::memory_order_acquire);
+    Node old_head = unpack(old_value);
     Node new_head = old_head;
 
     do {
@@ -159,8 +169,9 @@ class LockFreeFreeList {
       new_head.aba_counter = old_head.aba_counter + 1;
 
       // CAS原子更新链表头：成功则回收完成，失败则重试
-    } while (!m_head.compare_exchange_weak(old_head, new_head, std::memory_order_acq_rel,
-                                           std::memory_order_acquire));
+    } while (!m_head.compare_exchange_weak(old_value, pack(new_head), std::memory_order_acq_rel,
+                                           std::memory_order_acquire) &&
+             (old_head = unpack(old_value), true));
 
     return true;
   }
@@ -176,8 +187,12 @@ class LockFreeFreeList {
     if (!is_initialized()) {
       return true;
     }
-    return m_head.load(std::memory_order_acquire).next_free_index >= m_size;
+    return unpack(m_head.load(std::memory_order_acquire)).next_free_index >= m_size;
   }
+
+  // Inter-process use is supported only when the composite ABA-protected head
+  // is implemented without a process-local library lock.
+  bool is_lock_free() const noexcept { return m_head.is_lock_free(); }
 };
 
 #endif  // LOCK_FREE_LIST_H_
