@@ -1,0 +1,11 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy: {matrix: {build_type: [Debug, Release]}}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure

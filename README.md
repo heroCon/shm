@@ -1,77 +1,34 @@
-# lockfree_shm
+# shm_pubsub
 
-一个基于 Linux 共享内存的轻量级发布订阅示例，目标是用较少依赖演示多进程通信中的广播/竞争消费两种投递模式、无锁 MPMC 消息队列、无锁空闲块管理、固定块内存池、心跳检测与离线回收。
+一个面向 **Linux 的实验性 IPC 头文件库**，使用固定大小共享内存块提供广播与竞争消费。0.2 版明确了生命周期和故障边界；它不是持久化消息中间件。
 
-## 项目内容
-
-- `publisher`：发布进程示例，循环发送 `TestTopic` 数据。
-- `subscriber`：订阅进程示例，非阻塞轮询接收数据。
-- `shm_pubsub.h`：核心发布订阅实现（共享内存布局、注册、收发、回收逻辑）。
-- `lock_free_list.h`：无锁空闲块管理结构（自由链表）。
-- `test_topic.h`：示例消息结构。
-- `delay_time.h`：延迟统计工具。
-
-## 环境要求
-
-- Linux（依赖 POSIX 共享内存接口，如 `shm_open` / `mmap`）
-- CMake >= 3.10
-- 支持 C++11 及以上的编译器
-
-## 构建
+## 快速开始
 
 ```bash
-mkdir -p build
-cd build
-cmake ..
-make
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+./build/subscriber /demo &
+./build/publisher /demo
 ```
 
-生成可执行文件：
+头文件库目标为 `shm_pubsub::shm_pubsub`。外部项目可 `add_subdirectory` 后执行 `target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)`。构造参数 `Options` 可配置 POSIX 共享内存名称。正常退出调用 `stop()`；确认所有参与者都已脱离后，才调用 `ShmPubSub::destroy(name)`。
 
-- `build/publisher`
-- `build/subscriber`
+## 架构
 
-## 运行
-
-建议开两个终端：
-
-1. 启动订阅者
-
-```bash
-./build/subscriber
+```text
+发布者 -> 固定块池 -> 每订阅者 MPMC 队列 -> 所有广播订阅者
+                 `-> 共享 MPMC 队列 ------> 一个竞争消费者
 ```
 
-2. 启动发布者
+`publish_result` 区分无订阅者、队列满、部分广播和超长消息；`receive_result` 区分暂无消息和缓冲区不足。详见[接口语义](docs/api-semantics.md)、[生命周期与恢复](docs/lifecycle.md)及[无锁平台约束](docs/lock-free-design.md)。
 
-```bash
-./build/publisher
-```
+## 示例与性能
 
-你会在订阅者侧看到持续递增的消息计数。
+`broadcast_example` 展示结构化发布结果，`competing_example` 处理真实字节。运行 `./scripts/run-benchmarks.sh` 可生成共享内存与 Unix Domain Datagram 基线 CSV；计时方法与语义差异见[性能文档](docs/benchmark.md)。
 
-## 核心设计（简述）
+## 支持范围与限制
 
-- 使用固定数量的数据块作为共享内存消息池。
-- 发布时先分配块，再写入数据；广播模式会把块 ID 投递到每个订阅者队列，竞争消费模式会把块 ID 投递到共享队列。
-- 发布者可选择 `BROADCAST` 或 `COMPETING`：前者让每个订阅者都能收到同一数据，后者让多个订阅者竞争消费同一共享队列中的数据。
-- 通过心跳检测离线发布者/订阅者，并尝试回收其相关资源。
+支持 Linux、参与进程一致 ABI、CMake 3.10+，且所需原子类型运行时必须真正 lock-free。投递为至多一次，队列压力下按约定丢弃。不提供持久化、认证、模式协商、发布者崩溃分配日志或初始化者接管。心跳回收假定进程能在五秒内获得调度。另见[路线图](ROADMAP.md)、[更新记录](CHANGELOG.md)和[贡献指南](CONTRIBUTING.md)。项目采用 MIT 许可证；单独标注的自由链表采用 Apache-2.0 OR MIT。
 
-
-### 投递模式
-
-`ShmPubSub::publish` 默认使用广播模式；也可以显式传入竞争消费模式：
-
-```cpp
-pub.publish(msg, sizeof(TestTopic), ShmPubSub::BROADCAST);   // 每个订阅者各收到一份
-pub.publish(msg, sizeof(TestTopic), ShmPubSub::COMPETING);   // 只有一个订阅者消费该消息
-```
-
-## 当前实现注意事项
-
-- 这是实验性质示例，侧重演示机制，不等同于生产级消息中间件。
-- 共享内存清理策略当前较为直接（析构时 `shm_unlink`），多进程并发退出场景下建议进一步完善。
-- 建议在压测和异常退出场景下验证回收逻辑与边界行为。
-
-## English Version
-
-See `README.en.md`.
+[English](README.en.md)

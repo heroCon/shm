@@ -6,6 +6,9 @@
 
 #include "lock_free_list.h"
 
+#undef assert
+#define assert(condition) do { if (!(condition)) std::abort(); } while (false)
+
 int main() {
   LockFreeFreeList<uint32_t, 3> free_list;
   free_list.init();
