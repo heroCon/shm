@@ -56,7 +56,10 @@ template <typename IndexType = uint32_t, size_t CAPACITY = 32>
 class LockFreeFreeList {
  private:
   // 链表头节点：索引+版本号（解决ABA问题）
-  struct Node { uint32_t next_free_index; uint32_t aba_counter; };
+  struct Node {
+    uint32_t next_free_index;
+    uint32_t aba_counter;
+  };
   static uint64_t pack(Node n) noexcept {
     return static_cast<uint64_t>(n.aba_counter) << 32 | n.next_free_index;
   }
@@ -122,10 +125,11 @@ class LockFreeFreeList {
 
       // CAS原子更新链表头：成功则分配完成，失败则重试（自动更新old_head为最新值）
     } while (!m_head.compare_exchange_weak(
-        old_value, pack(new_head),
-        std::memory_order_acq_rel,  // 成功：写操作释放语义，读操作获取语义
-        std::memory_order_acquire   // 失败：仅读取，获取语义
-        ) && (old_head = unpack(old_value), true));
+                 old_value, pack(new_head),
+                 std::memory_order_acq_rel,  // 成功：写操作释放语义，读操作获取语义
+                 std::memory_order_acquire   // 失败：仅读取，获取语义
+                 ) &&
+             (old_head = unpack(old_value), true));
 
     // 传出分配的索引（原头指向的空闲索引）
     index = old_head.next_free_index;
