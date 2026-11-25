@@ -2,7 +2,6 @@
 #include <chrono>
 #include <csignal>
 #include <iostream>
-#include <thread>
 
 #include "shm_pubsub.h"
 #include "test_topic.h"
@@ -19,11 +18,13 @@ int main(int argc, char** argv) {
     TestTopic msg{};
     size_t n = 0;
     while (running.load()) {
-      auto r = sub.receive_result(&msg, sizeof(msg), n);
+      auto r = sub.receive_wait(&msg, sizeof(msg), n, std::chrono::milliseconds(250));
       if (r.status == ShmPubSub::Status::OK)
         std::cout << "received " << msg.timestamp << '\n';
-      else
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      else if (r.status != ShmPubSub::Status::TIMED_OUT) {
+        std::cerr << "receive failed: " << static_cast<int>(r.status) << '\n';
+        return 1;
+      }
     }
     sub.stop();
   } catch (const std::exception& e) {
