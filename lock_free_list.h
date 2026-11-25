@@ -68,8 +68,8 @@ class LockFreeFreeList {
   }
   // 暂定直接使用数组，不能使用指针，因为指针在第一个进程初始化后的地址在第二个进程中无法访问
 
-  std::atomic<uint64_t> m_head;               // packed 32-bit index + 32-bit ABA counter
-  IndexType m_next_free_index[CAPACITY + 1];  // 空闲索引链表存储（包含一个尾哨兵槽位）
+  std::atomic<uint64_t> m_head{0};  // packed 32-bit index + 32-bit ABA counter
+  std::atomic<IndexType> m_next_free_index[CAPACITY + 1];  // 空闲索引链表存储（包含一个尾哨兵槽位）
   IndexType m_size;                           // 最大容量（支持的有效索引：0 ~ m_size-1）
   IndexType m_invalid_index;                  // 无效索引标记（标记已分配的索引）
   std::atomic<bool> m_is_initialized{false};  // 初始化状态标记
@@ -92,10 +92,10 @@ class LockFreeFreeList {
 
     // 初始化空闲链表：buffer[i] = i+1（形成 0→1→2→...→capacity-1 的连续链表）
     for (IndexType i = 0; i < m_size; ++i) {
-      m_next_free_index[i] = i + 1;
+      std::atomic_init(&m_next_free_index[i], static_cast<IndexType>(i + 1));
     }
     // 链表尾节点指向无效索引（标记链表结束）
-    m_next_free_index[m_size] = m_invalid_index;
+    std::atomic_init(&m_next_free_index[m_size], m_invalid_index);
 
     // 初始化链表头：指向第一个空闲索引（0），版本号0
     m_head.store(pack({0, 0}), std::memory_order_release);
@@ -120,7 +120,10 @@ class LockFreeFreeList {
       }
 
       // 计算新链表头：新头 = 原头指向的下一个空闲索引，版本号+1
-      new_head.next_free_index = m_next_free_index[old_head.next_free_index];
+      // A competing pop may already own and modify this node. The CAS
+      // rejects a stale head; the speculative link read must still be atomic.
+      new_head.next_free_index =
+          m_next_free_index[old_head.next_free_index].load(std::memory_order_relaxed);
       new_head.aba_counter = old_head.aba_counter + 1;
 
       // CAS原子更新链表头：成功则分配完成，失败则重试（自动更新old_head为最新值）
@@ -134,10 +137,7 @@ class LockFreeFreeList {
     // 传出分配的索引（原头指向的空闲索引）
     index = old_head.next_free_index;
     // 标记该索引为已分配（避免double free）
-    m_next_free_index[index] = m_invalid_index;
-
-    // 释放栅栏：确保"标记索引为已分配"的写操作对其他线程（push）可见
-    std::atomic_thread_fence(std::memory_order_release);
+    m_next_free_index[index].store(m_invalid_index, std::memory_order_relaxed);
 
     return true;
   }
@@ -149,11 +149,9 @@ class LockFreeFreeList {
       return false;
     }
 
-    // 获取栅栏：确保能看到其他线程（pop）标记的"已分配"状态，避免double free
-    std::atomic_thread_fence(std::memory_order_acquire);
-
     // 校验索引有效性：1. 索引在有效范围（0~m_size-1）；2. 索引已分配（标记为无效索引）
-    if (index >= m_size || m_next_free_index[index] != m_invalid_index) {
+    if (index >= m_size ||
+        m_next_free_index[index].load(std::memory_order_relaxed) != m_invalid_index) {
       return false;
     }
 
@@ -163,7 +161,7 @@ class LockFreeFreeList {
 
     do {
       // 回收的索引指向原链表头（头插法：新索引成为新的链表头前驱）
-      m_next_free_index[index] = old_head.next_free_index;
+      m_next_free_index[index].store(old_head.next_free_index, std::memory_order_relaxed);
       // 新链表头：指向回收的索引，版本号+1
       new_head.next_free_index = index;
       new_head.aba_counter = old_head.aba_counter + 1;
@@ -192,7 +190,9 @@ class LockFreeFreeList {
 
   // Inter-process use is supported only when the composite ABA-protected head
   // is implemented without a process-local library lock.
-  bool is_lock_free() const noexcept { return m_head.is_lock_free(); }
+  bool is_lock_free() const noexcept {
+    return m_head.is_lock_free() && m_next_free_index[0].is_lock_free();
+  }
 };
 
 #endif  // LOCK_FREE_LIST_H_
