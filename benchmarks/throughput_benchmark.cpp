@@ -1,6 +1,7 @@
 // Zero-copy throughput: one publisher thread, N busy-polling subscriber
-// threads in one process. A publish counts once every subscriber queued it;
-// otherwise the publisher retries with a new message.
+// threads in one process. A publish counts once at least one subscriber
+// queued it; one that reached nobody is retried. `delivered` counts queue
+// entries and should equal `received`.
 // Usage: throughput_benchmark [subscribers] [messages] [bytes]
 #include <atomic>
 #include <chrono>
@@ -41,7 +42,7 @@ int main(int argc, char** argv) {
       received += n;
     });
   }
-  long retries = 0;
+  long retries = 0, partial = 0, delivered = 0;
   const auto start = std::chrono::steady_clock::now();
   for (long i = 0; i < count;) {
     Topic::WriteLoan loan;
@@ -50,11 +51,14 @@ int main(int argc, char** argv) {
       continue;
     }
     loan.data()[0] = static_cast<char>(i);
-    if (pub.publish(std::move(loan)).status == Status::kOk) {
-      ++i;
-    } else {
+    const shm_pubsub::PublishResult r = pub.publish(std::move(loan));
+    if (r.delivered == 0) {
       ++retries;
+      continue;
     }
+    if (r.status == Status::kPartial) ++partial;
+    delivered += r.delivered;
+    ++i;
   }
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -62,7 +66,8 @@ int main(int argc, char** argv) {
   done = true;
   for (auto& t : threads) t.join();
   std::printf(
-      "transport,subscribers,message_bytes,messages,seconds,publish_per_sec,retries,received\n");
-  std::printf("shm,%d,%zu,%ld,%.4f,%.0f,%ld,%ld\n", subscribers, bytes, count, seconds,
-              count / seconds, retries, received.load());
+      "transport,subscribers,message_bytes,messages,seconds,publish_per_sec,retries,partial,"
+      "delivered,received\n");
+  std::printf("shm,%d,%zu,%ld,%.4f,%.0f,%ld,%ld,%ld,%ld\n", subscribers, bytes, count, seconds,
+              count / seconds, retries, partial, delivered, received.load());
 }
