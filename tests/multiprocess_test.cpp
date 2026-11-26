@@ -1,25 +1,64 @@
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
-#include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <thread>
 
-#include "shm_pubsub.h"
+#include "test_util.hpp"
 
-static int fail(const char* text) {
-  std::cerr << text << '\n';
-  return 1;
+using shm_pubsub::Status;
+using Topic = shm_pubsub::Topic<SmallConfig>;
+
+static void kill_and_reap(pid_t child) {
+  kill(child, SIGKILL);
+  waitpid(child, nullptr, 0);
 }
-static int check_reclaim(const ShmPubSub::Options& o) {
-  pid_t child = fork();
-  if (child < 0) return fail("reclaim fork failed");
+
+// A blocked subscriber in another process is woken by a publish.
+static void check_cross_process_wakeup(const shm_pubsub::Options& o) {
+  int ready[2];
+  CHECK(pipe(ready) == 0);
+  const pid_t child = fork();
   if (child == 0) {
     try {
-      ShmPubSub sub(ShmPubSub::SUBSCRIBER, o);
-      sub.subscribe();
+      Topic topic(o);
+      Topic::Subscriber sub(topic);
+      char x = 1;
+      if (write(ready[1], &x, 1) != 1) _exit(5);
+      char out[16];
+      const auto start = std::chrono::steady_clock::now();
+      const auto r = sub.wait_receive(out, sizeof(out), std::chrono::seconds(5));
+      const bool woke = std::chrono::steady_clock::now() - start < std::chrono::seconds(4);
+      _exit(woke && r.status == Status::kOk && r.size == 6 && std::memcmp(out, "hello", 6) == 0
+                ? 0
+                : 2);
+    } catch (...) {
+      _exit(4);
+    }
+  }
+  Topic topic(o);
+  Topic::Publisher pub(topic);
+  char x;
+  CHECK(read(ready[0], &x, 1) == 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const auto r = pub.publish_copy("hello", 6);
+  CHECK(r.status == Status::kOk && r.delivered == 1);
+  int status = 0;
+  waitpid(child, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  close(ready[0]);
+  close(ready[1]);
+}
+
+// A stopped reader keeps its slot; a killed one is reclaimed with its queue.
+static void check_reader_reclaim(const shm_pubsub::Options& o) {
+  const pid_t child = fork();
+  if (child == 0) {
+    try {
+      Topic topic(o);
+      Topic::Subscriber sub(topic);
       raise(SIGSTOP);
       _exit(2);
     } catch (...) {
@@ -27,89 +66,54 @@ static int check_reclaim(const ShmPubSub::Options& o) {
     }
   }
   int status = 0;
-  const bool paused = waitpid(child, &status, WUNTRACED) == child && WIFSTOPPED(status);
-  bool queued = paused;
-  bool reclaimed = false;
-  try {
-    ShmPubSub pub(ShmPubSub::PUBLISHER, o);
-    if (paused) {
-      queued = pub.collect_garbage() == 0 && pub.get_valid_subscriber_count() == 1;
-      for (size_t i = 0; i < BLOCK_COUNT; ++i)
-        queued &= pub.publish_result("x", 1).status == ShmPubSub::Status::OK;
-    }
-    if (paused) {
-      kill(child, SIGKILL);
-      waitpid(child, nullptr, 0);
-    }
-    if (queued) {
-      // The pool is full of queued references. Allocation pressure reaps the
-      // dead reader, then the same region can accept another subscriber.
-      ShmPubSub::WriteLoan sample;
-      reclaimed =
-          pub.loan(1, sample) == ShmPubSub::Status::OK && pub.get_valid_subscriber_count() == 0;
-      sample.reset();
-      ShmPubSub replacement(ShmPubSub::SUBSCRIBER, o);
-      replacement.subscribe();
-      ShmPubSub::ReadLoan read;
-      reclaimed &= replacement.take(read) == ShmPubSub::Status::WOULD_BLOCK;
-      for (size_t i = 0; i < BLOCK_COUNT; ++i)
-        reclaimed &= pub.publish_result("y", 1).status == ShmPubSub::Status::OK;
-    }
-  } catch (const std::exception& e) {
-    if (waitpid(child, nullptr, WNOHANG) == 0) {
-      kill(child, SIGKILL);
-      waitpid(child, nullptr, 0);
-    }
-    return fail(e.what());
+  CHECK(waitpid(child, &status, WUNTRACED) == child && WIFSTOPPED(status));
+  Topic topic(o);
+  Topic::Publisher pub(topic);
+  CHECK(topic.collect_garbage() == 0 && topic.subscriber_count() == 1);
+  for (uint32_t i = 0; i < Topic::kQueueCapacity; ++i) {
+    CHECK(pub.publish_copy("x", 1).status == Status::kOk);
   }
-  return queued && reclaimed ? 0 : fail("paused or killed reader reclamation");
+  CHECK(pub.publish_copy("x", 1).status == Status::kQueueFull);
+  CHECK(free_blocks(topic) == Topic::kBlockCount - Topic::kQueueCapacity);
+  kill_and_reap(child);
+  CHECK(topic.collect_garbage() == 1);
+  CHECK(topic.subscriber_count() == 0);
+  CHECK(free_blocks(topic) == Topic::kBlockCount);
+  Topic::Subscriber replacement(topic);
+  Topic::ReadLoan read;
+  CHECK(replacement.take(read) == Status::kWouldBlock);
+  CHECK(pub.publish_copy("y", 1).status == Status::kOk);
+  CHECK(replacement.take(read) == Status::kOk && read.data()[0] == 'y');
+}
+
+// Registration after a crash reclaims the slot it lands on.
+static void check_slot_reuse(const shm_pubsub::Options& o) {
+  for (uint32_t round = 0; round < Topic::kMaxSubscribers * 2; ++round) {
+    const pid_t child = fork();
+    if (child == 0) {
+      try {
+        Topic topic(o);
+        Topic::Subscriber sub(topic);
+        raise(SIGKILL);
+      } catch (...) {
+      }
+      _exit(3);
+    }
+    waitpid(child, nullptr, 0);
+  }
+  Topic topic(o);
+  Topic::Subscriber sub(topic);
+  topic.collect_garbage();
+  CHECK(topic.subscriber_count() == 1);
+  CHECK(free_blocks(topic) == Topic::kBlockCount);
 }
 
 int main() {
-  ShmPubSub::Options o;
-  o.name = "/shm_pubsub_test_" + std::to_string(getpid());
-  ShmPubSub::destroy(o.name);
-  pid_t child = fork();
-  if (child < 0) return fail("fork failed");
-  if (child == 0) {
-    try {
-      ShmPubSub sub(ShmPubSub::SUBSCRIBER, o);
-      sub.subscribe();
-      char out[16];
-      size_t n = 0;
-      const auto start = std::chrono::steady_clock::now();
-      auto r = sub.receive_wait(out, sizeof(out), n, std::chrono::seconds(5));
-      const bool woke = std::chrono::steady_clock::now() - start < std::chrono::seconds(4);
-      const bool received =
-          r.status == ShmPubSub::Status::OK && n == 6 && std::memcmp(out, "hello", 6) == 0;
-      _exit(woke && received ? 0 : 2);
-    } catch (...) {
-      _exit(4);
-    }
-  }
-  try {
-    ShmPubSub pub(ShmPubSub::PUBLISHER, o);
-    for (int i = 0; i < 500 && pub.get_valid_subscriber_count() == 0; ++i)
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    auto r = pub.publish_result("hello", 6);
-    if (r.status != ShmPubSub::Status::OK || r.delivered != 1) {
-      kill(child, SIGKILL);
-      waitpid(child, nullptr, 0);
-      ShmPubSub::destroy(o.name);
-      return fail("publish failed");
-    }
-  } catch (const std::exception& e) {
-    kill(child, SIGKILL);
-    waitpid(child, nullptr, 0);
-    ShmPubSub::destroy(o.name);
-    return fail(e.what());
-  }
-  int status = 0;
-  waitpid(child, &status, 0);
-  ShmPubSub::destroy(o.name);
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return fail("child failed");
-  int result = check_reclaim(o);
-  ShmPubSub::destroy(o.name);
-  return result;
+  ScopedName name("multiprocess");
+  shm_pubsub::Options o;
+  o.name = name.name;
+  check_cross_process_wakeup(o);
+  check_reader_reclaim(o);
+  check_slot_reuse(o);
+  return finish("multiprocess_test");
 }
