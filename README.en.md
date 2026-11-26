@@ -1,6 +1,23 @@
 # shm_pubsub
 
-A two-header **C++11 Linux IPC library** for fixed-size shared-memory messages. Supports zero-copy broadcast, competing consumers, and blocking receive, with no daemon or library worker threads.
+A header-only **C++11** shared-memory publish/subscribe library for Linux that is
+**crash-verified**: a process can be `SIGKILL`ed at any of 13 named points inside
+the data path and the surviving processes get every block back and keep
+exchanging messages. There is no daemon, no background thread and no
+dependency beyond the C++ standard library and Linux.
+
+- **Zero copy.** Publishers write into a loaned shared-memory block; subscribers
+  read it in place.
+- **Broadcast and consumer groups in one mechanism.** Every publish reaches each
+  private subscriber and exactly one member of each consumer group.
+- **Bounded by construction.** Capacities are compile-time parameters, and a
+  `static_assert` guarantees that slow or stalled subscribers can never exhaust the
+  block pool. Each queue picks `kDropNewest` or `kDropOldest`.
+- **Targeted wake-ups.** Each queue has its own futex word, so a group publish wakes
+  one member and a private queue wakes only its owner. `WaitSet` waits on several
+  subscribers, even across topics, with `futex_waitv`.
+- **Observable.** `shmtop` shows liveness, queue depths, loans and drop counters of a
+  running region without attaching to it.
 
 ## Quick start
 
@@ -8,43 +25,79 @@ A two-header **C++11 Linux IPC library** for fixed-size shared-memory messages. 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
-./build/subscriber /demo &
-./build/publisher /demo
+./build/subscriber_example /demo &
+./build/publisher_example /demo
+./build/shmtop /demo --once
 ```
-
-The header-only target is `shm_pubsub::shm_pubsub`. Consumers can use `add_subdirectory`, then `target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)`. The optional constructor `Options` configures the POSIX shared-memory name. Use `stop()` to wake blocked receivers during shutdown. Call `ShmPubSub::destroy(name)` after every participant has detached.
-
-## Zero copy and waiting
-
-A publisher calls `loan()`, fills up to 4072 bytes in shared memory, then commits with `publish_loan()`. A subscriber reads in place with `take()` or waits with `wait_take()`. Loan handles release their references on destruction. The copy APIs remain available, including `receive_wait()` for a blocking copy.
 
 ```cpp
-ShmPubSub::WriteLoan write;
-if (pub.loan(1, write) == ShmPubSub::Status::OK) {
-  write.data()[0] = 'x';
-  pub.publish_loan(std::move(write));
+#include "shm_pubsub/shm_pubsub.hpp"
+
+shm_pubsub::Options options;
+options.name = "/demo";
+shm_pubsub::Topic<> topic(options);             // creates or attaches
+shm_pubsub::Topic<>::Publisher pub(topic);
+shm_pubsub::Topic<>::Subscriber sub(topic);     // private queue, subscribed
+
+shm_pubsub::Topic<>::WriteLoan write;
+if (pub.loan(5, write) == shm_pubsub::Status::kOk) {
+  std::memcpy(write.data(), "hello", 5);
+  pub.publish(std::move(write));                // PublishResult: targets, delivered, drops
 }
-ShmPubSub::ReadLoan read;
-if (sub.wait_take(read, std::chrono::milliseconds(250)) == ShmPubSub::Status::OK) {
-  std::cout << read.data()[0] << '\n';
+
+shm_pubsub::Topic<>::ReadLoan read;
+if (sub.wait_take(read, std::chrono::milliseconds(100)) == shm_pubsub::Status::kOk) {
+  // read.data(), read.size(), read.sequence(), read.timestamp_ns(), read.publisher_id()
 }
 ```
 
-## Architecture
+Competing consumers join a group: `SubscriberOptions o; o.group = 1;`. Capacities
+come from a `Config` type (`Topic<MyConfig>`). Every process attached to a region
+must use the same `Config`; the region header stores a hash and rejects mismatches.
 
-```text
-publisher(s) -> fixed block pool -> per-reader MPMC queue -> every broadcast reader
-                             `----> shared MPMC queue -----> one competing reader
+## Using it from CMake
+
+```cmake
+find_package(shm_pubsub 0.3 REQUIRED)     # after cmake --install
+# or: add_subdirectory(shm_pubsub)
+target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)
 ```
 
-`publish_result` reports no subscribers, full queues, partial broadcast and oversize input. `receive_result` reports empty queues and insufficient buffers. See [exact API semantics](docs/api-semantics.md), [lifecycle/recovery](docs/lifecycle.md), and [lock-free platform contract](docs/lock-free-design.md).
+When added as a subproject, only the library target is defined; examples, tests and
+tools build only at top level (`SHM_PUBSUB_BUILD_*` options).
 
-## Examples and performance
+## How it differs
 
-`broadcast_example` shows structured publish results; `competing_example` handles real payload bytes. Run `./scripts/run-benchmarks.sh` for shared-memory and Unix-domain-datagram raw CSV baselines; methodology and semantic differences are in [the benchmark guide](docs/benchmark.md).
+| | shm_pubsub | iceoryx2 | eCAL | cpp-ipc |
+|---|---|---|---|---|
+| Integration | 1 header directory, C++11 | Rust core with C/C++ bindings | Runtime, services, monitoring | Library to build |
+| Central daemon | none | none | none (per-process registration threads) | none |
+| Consumer groups (work queue) next to broadcast | yes, one mechanism | no | no | route vs channel types |
+| Crash recovery verified per fault point | yes, in CI | dead-node cleanup | n/a | not documented |
 
-## Support and limitations
+See [docs/comparison.md](docs/comparison.md) for the details and where each
+alternative is the better choice.
 
-Requires Linux 3.15+, a common ABI, CMake 3.10+, and runtime lock-free atomics. Delivery is at most once. Subscriber queues are reclaimed on demand after exit. Death while holding a loan or updating a queue can still strand resources. Upgrading to shared-memory layout 4 requires a fresh name or recreation after all old endpoints have detached. Review [the roadmap](ROADMAP.md), [changelog](CHANGELOG.md), and [contribution guide](CONTRIBUTING.md). Licensed under MIT, with the separately marked free-list under Apache-2.0 OR MIT.
+## Documents
+
+- [API semantics](docs/api-semantics.md): statuses, ownership, ordering, overflow.
+- [Lifecycle](docs/lifecycle.md): creation, endpoint liveness, reclamation, `fork()`.
+- [Crash consistency](docs/crash-consistency.md): what is recovered, the fault
+  matrix and the remaining windows.
+- [Lock-free design](docs/lock-free-design.md) and platform requirements.
+- [Benchmarks](docs/benchmark.md), [comparison](docs/comparison.md),
+  [roadmap](ROADMAP.md), [changelog](CHANGELOG.md) including 0.2 → 0.3 migration,
+  and [contributing](CONTRIBUTING.md).
+
+## Requirements and limits
+
+Linux 3.15+ (OFD locks, process-shared futexes); `WaitSet` needs 5.16+ for
+`futex_waitv` and reports `kNotSupported` otherwise. All processes must share the
+architecture, ABI and `Config`. Delivery is in memory and at most once; there is no
+persistence or history replay. Endpoints are not thread-safe, so use one per thread.
+At most 48 endpoints per topic.
+
+MIT licensed. `detail/lock_free_list.hpp` is derived from Eclipse iceoryx
+(Apache-2.0 OR MIT); see [NOTICE](NOTICE).
 
 [中文说明](README.md)

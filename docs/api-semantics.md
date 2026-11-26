@@ -1,27 +1,103 @@
 # API semantics
 
-`publish_result` and `receive_result` are the normative API; the legacy Boolean wrappers report only success.
+Everything lives in namespace `shm_pubsub`. A `Topic<Config>` owns one mapping of a
+named region; `Topic::Publisher` and `Topic::Subscriber` are endpoints created from it.
+Each endpoint occupies one slot in the region for its lifetime.
 
-| Situation | Result and ownership |
+## Configuration
+
+`Config` supplies `kBlockCount`, `kBlockSize` (including a 64-byte block header, so the
+payload limit is `Topic::max_payload_size()`), `kQueueCapacity`, `kMaxPublishers`,
+`kMaxSubscribers`, `kMaxGroups`, `kMaxLoansPerPublisher` and `kMaxLoansPerSubscriber`.
+Derive from `DefaultConfig` and redeclare the members you change. Compile-time checks
+enforce:
+
+- `kQueueCapacity` is a power of two and smaller than `kBlockCount`;
+- at most 48 endpoints (`kMaxPublishers + kMaxSubscribers`) and 24 publishers;
+- the **pool budget** `kBlockCount >= (kMaxSubscribers + kMaxGroups) * kQueueCapacity +
+  kMaxSubscribers * kMaxLoansPerSubscriber + kMaxPublishers * kMaxLoansPerPublisher`.
+
+Because every reference to a block is either a queue entry or a loan, and both are
+bounded, the budget means the pool cannot run dry no matter how slowly subscribers read.
+`kPoolExhausted` therefore indicates leaked blocks, which `loan()` tries to recover
+before it reports the status.
+
+The region header stores a hash of the configuration and the layout version (5). An
+attach with a different `Config` or layout throws `std::runtime_error`.
+
+## Publishing
+
+| Call | Result |
 |---|---|
-| No active subscribed reader | `NO_SUBSCRIBERS`; no block is allocated. This is a successful, intentional drop. |
-| Pool or competing queue full | `QUEUE_FULL`; the message is not delivered. |
-| Some broadcast queues full | `PARTIAL` and `delivered` is the exact successful enqueue count. Full readers miss that message. |
-| Message exceeds 4072 bytes | `MESSAGE_TOO_LARGE`; nothing is truncated or delivered; `required_size` gives capacity. |
-| Receive buffer too small | `BUFFER_TOO_SMALL`; `actual_len`/`required_size` give the message size. The dequeued message is consumed and released, and no partial bytes are copied. |
-| No queued message | `WOULD_BLOCK`. |
+| `loan(size, write)` | `kOk` and a block of `size` bytes (1..`max_payload_size()`); `kLoanLimit` when the endpoint already holds `kMaxLoansPerPublisher` loans; `kMessageTooLarge`; `kInvalidArgument` for size 0 or a non-empty `write`; `kPoolExhausted` only after leaks that `collect_garbage()` and `recover()` could not undo. |
+| `write.resize(n)` | Shrinks or grows the payload within `capacity()`. |
+| `publish(std::move(write))` | Consumes the loan whenever it belongs to this publisher, whatever the status. Returns a `PublishResult`. |
+| `publish_copy(data, size)` | `loan` + `memcpy` + `publish`; returns `kNoSubscribers` without allocating when nobody is eligible. |
 
-Each queue is FIFO for its successfully enqueued messages. Concurrent publishers have no global ordering guarantee. Broadcast is best effort and has at-most-once delivery per subscriber; competing delivery is at-most-once to one active subscriber. Queue pressure drops new messages, never old messages. Reconnecting creates a new slot generation and does not replay history. A subscriber reads its broadcast queue before the competing queue, so the two modes are not mutually ordered.
+`PublishResult` has `targets` (subscribed private subscribers plus groups with at least
+one member), `delivered`, `dropped_oldest` and `status`:
 
-Constructors throw on system errors, incompatible layouts, timeouts, unsupported atomics, and exhausted registration slots. Shared-memory names must be POSIX names beginning with `/`.
-
-## Zero-copy and blocking operations
-
-| Operation | Ownership and result |
+| Status | Meaning |
 |---|---|
-| `loan(size, write)` | Requires an empty `WriteLoan` and 1–4072 bytes. On success fill all requested bytes directly through `write.data()`. |
-| `publish_loan(std::move(write), mode)` | Requires a loan from this publisher. A valid call consumes it on success, partial delivery, queue pressure, or no subscribers. The write pointer must no longer be used once the call starts. An invalid call leaves ownership with its original publisher. |
-| `take(read)` | Requires an empty `ReadLoan`. Returns `WOULD_BLOCK` if both queues are empty. A successful loan exposes a read-only view. The block stays reserved until the last reference in queues or read loans is released. |
-| `wait_take(read, timeout)` / `receive_wait(buf, len, actual, timeout)` | Wait on a process-shared Linux futex, recheck the queues after wakeup, and return `TIMED_OUT` if still empty at the deadline. A zero timeout performs an immediate attempt. Negative timeouts are invalid. `stop()` causes current and future blocking calls to return `STOPPED` unless a call has already dequeued a message. |
+| `kOk` | Every target queued the message. |
+| `kNoSubscribers` | No targets; the message was dropped on purpose. |
+| `kPartial` | Some targets queued it; the others were full under `kDropNewest`. |
+| `kQueueFull` | Every target was full under `kDropNewest`. |
 
-Both loan types are movable and release their references on reset or destruction. The endpoint must outlive its loans, and each loan object is owned by one caller at a time. Existing copy APIs interoperate with loan APIs. `subscribe()` enables delivery eligibility as before. Broadcast and competing traffic share one futex per region, so a wake can reach readers whose queues remain empty. A publisher that dies after enqueue but before notification can delay a wakeup until the next notification or the deadline.
+`ok()` is true for `kOk`, `kNoSubscribers` and `kPartial`. Every block header records
+the publisher slot, a per-publisher `sequence` that increments on every publish, and a
+`CLOCK_MONOTONIC` timestamp. A reader that sees a gap in `sequence` for one publisher
+missed messages, through a full queue, `kDropOldest`, or a group sibling taking them.
+
+## Subscribing
+
+`Subscriber(topic, SubscriberOptions{group, overflow})`:
+
+- `group == 0` gives the subscriber a **private queue**; every publish is offered to it.
+- `group` in `1..kMaxGroups` joins a **consumer group**. Each group has one queue; every
+  publish is offered once per group, and exactly one member takes it.
+- `overflow` selects `kDropNewest` (a full queue rejects the new message) or
+  `kDropOldest` (the publisher discards the oldest queued message to make room). For a
+  group the policy of the most recently registered member applies to the whole group.
+
+A subscriber is subscribed on construction. `unsubscribe()` makes it ineligible for new
+messages; its private queue keeps what it already holds, and `take()` returns
+`kNotSubscribed` until `subscribe()`. A group member that unsubscribes leaves the group;
+queued group messages stay for the remaining members.
+
+| Call | Result |
+|---|---|
+| `take(read)` | `kOk` with a read-only view; `kWouldBlock` if the queue is empty; `kNotSubscribed`; `kLoanLimit` at `kMaxLoansPerSubscriber` held loans; `kInvalidArgument` for a non-empty `read`; `kCorrupted` if a queued block id or size fails validation (the entry is skipped). |
+| `wait_take(read, timeout)` | Blocks on the queue's futex word. `kTimedOut` at the deadline, `kStopped` after `stop()`. A zero timeout makes one attempt; negative timeouts are invalid. |
+| `receive(buf, size)` / `wait_receive(...)` | Copy variants returning `ReceiveResult{status, size}`. `kBufferTooSmall` reports the size; the message is consumed and not copied. |
+| `stop()` | Any thread may call it. Current and future blocking calls return `kStopped`. A stopping group member passes a pending wake-up on to another member. |
+
+`ReadLoan` exposes `data()`, `size()`, `sequence()`, `timestamp_ns()` and
+`publisher_id()`. Both loan types are move-only and release their reference on
+`reset()` or destruction; the endpoint must outlive its loans.
+
+## Ordering and delivery
+
+- Each queue is FIFO. Messages of one publisher reach one queue in publish order.
+  Concurrent publishers have no global order.
+- Delivery is at most once per private subscriber and at most once per group.
+  Reconnecting creates a new slot generation and does not replay history.
+- A message taken by a group member that then crashes is lost, not redelivered.
+
+## WaitSet
+
+`WaitSet` waits on up to 128 subscribers, which may belong to topics with different
+`Config`s, with one `futex_waitv` call (Linux 5.16+). `WaitSet::supported()` probes the
+kernel once; `wait()` returns `kNotSupported` without it. `wait(timeout, &index)`
+returns `kOk` with the index (in insertion order) of a subscriber whose queue head is
+ready, `kStopped` if one was stopped, or `kTimedOut`. Readiness is a hint: for groups
+another member may take the message first, so call `take()` and handle `kWouldBlock`.
+A process woken for a group message should take it, otherwise the wake-up is not
+passed on.
+
+## Errors
+
+Constructors throw `std::system_error` for system call failures and
+`std::runtime_error` for layout or configuration mismatches, initialization timeouts
+and full slot tables; `Subscriber` throws `std::invalid_argument` for a group outside
+`0..kMaxGroups` and `Topic` throws it for a name that does not begin with `/`.
