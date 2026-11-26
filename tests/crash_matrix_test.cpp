@@ -78,7 +78,9 @@ static bool recover_fully(Topic& topic, shm_pubsub::RecoveryReport& report) {
   return false;
 }
 
-static bool run_point(const char* point, int hit) {
+// With garbage_only, the survivors call only collect_garbage(); a later
+// recover() must then find nothing left to repair.
+static bool run_point(const char* point, int hit, bool garbage_only) {
   ScopedName name("crash_matrix");
   shm_pubsub::Options o;
   o.name = name.name;
@@ -105,7 +107,17 @@ static bool run_point(const char* point, int hit) {
   drain(survivor);
   drain(survivor_worker);
   shm_pubsub::RecoveryReport report;
-  const bool recovered = recover_fully(topic, report);
+  bool recovered;
+  if (garbage_only) {
+    recovered = topic.collect_garbage() >= 1;
+    shm_pubsub::RecoveryReport leftover;
+    recovered &= recover_fully(topic, leftover) && leftover.orphans_freed == 0 &&
+                 leftover.states_repaired == 0 && leftover.holes_filled == 0 &&
+                 leftover.cells_released == 0 && leftover.pins_cleared == 0 &&
+                 leftover.slots_reclaimed == 0;
+  } else {
+    recovered = recover_fully(topic, report);
+  }
   drain(survivor);
   drain(survivor_worker);
   const uint32_t free_after = free_blocks(topic);
@@ -122,6 +134,11 @@ static bool run_point(const char* point, int hit) {
   }
   const bool conserved =
       free_blocks(topic) == Topic::kBlockCount && free_after == Topic::kBlockCount;
+  if (garbage_only) {
+    std::printf("%-34s collect_garbage only: recovered=%d free=%u/%u works=%d\n", spec.c_str(),
+                recovered, free_after, Topic::kBlockCount, works);
+    return recovered && conserved && works;
+  }
   std::printf(
       "%-34s recovered=%d free=%u/%u works=%d reclaimed=%u orphans=%u repaired=%u "
       "holes=%u cells=%u pins=%u\n",
@@ -136,8 +153,9 @@ int main() {
   for (size_t p = 0; p < shm_pubsub::detail::kFaultPointCount; ++p) {
     const int hits[] = {1, 2, 3, 5};
     for (int hit : hits) {
-      if (!run_point(shm_pubsub::detail::kFaultPoints[p], hit)) ++failures;
+      if (!run_point(shm_pubsub::detail::kFaultPoints[p], hit, false)) ++failures;
     }
+    if (!run_point(shm_pubsub::detail::kFaultPoints[p], 1, true)) ++failures;
   }
   if (failures) std::fprintf(stderr, "crash_matrix_test: %d failing point(s)\n", failures);
   return failures ? 1 : 0;

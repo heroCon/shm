@@ -669,7 +669,9 @@ class Topic {
   const Options& options() const { return options_; }
 
   // Reclaims slots whose owners exited: their loans, queued references,
-  // group memberships and publisher pins. Returns the number reclaimed.
+  // group memberships and publisher pins. Returns the number reclaimed. When
+  // it reclaims any, it also attempts recover() once, because a dead owner
+  // may have been mid-operation.
   size_t collect_garbage() {
     std::lock_guard<std::mutex> lock(mutex_);
     size_t reclaimed = 0;
@@ -682,6 +684,7 @@ class Topic {
       if (reclaim_slot(i, nullptr)) ++reclaimed;
       detail::ofd_lock(fd_, i, F_UNLCK);
     }
+    if (reclaimed) recover_locked(nullptr);
     return reclaimed;
   }
 
@@ -692,27 +695,7 @@ class Topic {
   // live endpoint is mid-operation; returns kBusy when it sees none.
   Status recover(RecoveryReport* report = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
-    RecoveryReport rep;
-    if (detail::ofd_lock(fd_, detail::kMaintenanceByte, F_WRLCK) != 0) return Status::kBusy;
-    bool locked[kSlots];
-    uint64_t live = 0;
-    for (uint32_t i = 0; i < kSlots; ++i) {
-      locked[i] = detail::ofd_lock(fd_, i, F_WRLCK) == 0;
-      if (!locked[i]) {
-        live |= 1ULL << i;
-      } else if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
-                     detail::kSlotFree &&
-                 reclaim_slot(i, &rep)) {
-        ++rep.slots_reclaimed;
-      }
-    }
-    const Status status = repair(live, rep);
-    for (uint32_t i = 0; i < kSlots; ++i) {
-      if (locked[i]) detail::ofd_lock(fd_, i, F_UNLCK);
-    }
-    detail::ofd_lock(fd_, detail::kMaintenanceByte, F_UNLCK);
-    if (report) *report = rep;
-    return status;
+    return recover_locked(report);
   }
 
   Snapshot snapshot() const { return make_snapshot(*region_, blocks_, fd_); }
@@ -856,6 +839,30 @@ class Topic {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+  }
+
+  Status recover_locked(RecoveryReport* report) {
+    RecoveryReport rep;
+    if (detail::ofd_lock(fd_, detail::kMaintenanceByte, F_WRLCK) != 0) return Status::kBusy;
+    bool locked[kSlots];
+    uint64_t live = 0;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      locked[i] = detail::ofd_lock(fd_, i, F_WRLCK) == 0;
+      if (!locked[i]) {
+        live |= 1ULL << i;
+      } else if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
+                     detail::kSlotFree &&
+                 reclaim_slot(i, &rep)) {
+        ++rep.slots_reclaimed;
+      }
+    }
+    const Status status = repair(live, rep);
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (locked[i]) detail::ofd_lock(fd_, i, F_UNLCK);
+    }
+    detail::ofd_lock(fd_, detail::kMaintenanceByte, F_UNLCK);
+    if (report) *report = rep;
+    return status;
   }
 
   void close_region() {
