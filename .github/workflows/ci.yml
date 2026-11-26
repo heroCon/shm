@@ -1,11 +1,74 @@
 name: ci
 on: [push, pull_request]
+
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    strategy: {matrix: {build_type: [Debug, Release]}}
+  build:
+    name: ${{ matrix.compiler }} ${{ matrix.build_type }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        compiler: [g++, clang++]
+        build_type: [Debug, Release]
+        include:
+          - os: ubuntu-24.04-arm
+            compiler: g++
+            build_type: Release
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DCMAKE_CXX_FLAGS=-Werror
+          -DSHM_PUBSUB_BUILD_BENCHMARKS=ON
+      - run: cmake --build build -j2
+      # Includes crash_matrix_test, which is built with SHM_PUBSUB_FAULT_INJECTION.
+      - run: ctest --test-dir build --output-on-failure
+      - name: Smoke benchmarks
+        run: |
+          build/throughput_benchmark 1 20000 64
+          build/latency_benchmark 2000 64 futex
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: tsan
+            flags: -fsanitize=thread -Wno-tsan
+          - name: asan-ubsan
+            flags: -fsanitize=address,undefined -fno-sanitize-recover=undefined
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++
+          "-DCMAKE_CXX_FLAGS=${{ matrix.flags }}"
       - run: cmake --build build -j2
       - run: ctest --test-dir build --output-on-failure
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - run: git ls-files '*.cpp' '*.hpp' '*.h' | xargs clang-format-18 --dry-run --Werror
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DSHM_PUBSUB_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$PWD/prefix
+      - run: cmake --build build && cmake --install build
+      - run: cmake -S tests/package_consumer -B consumer -DCMAKE_PREFIX_PATH=$PWD/prefix
+      - run: cmake --build consumer && consumer/package_consumer
+      - name: add_subdirectory consumer
+        run: |
+          cmake -S tests/package_consumer -B subdir -DSHM_PUBSUB_SOURCE_DIR=$PWD
+          cmake --build subdir && subdir/package_consumer

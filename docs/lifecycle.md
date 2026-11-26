@@ -1,13 +1,70 @@
-# Lifecycle and recovery
+# Lifecycle
 
-The process that wins `O_CREAT|O_EXCL` sizes the object, constructs the shared state, writes the magic/version/layout fields and publishes `READY` with a release store. Attachments verify the file size, wait for `READY` with a bounded timeout, then validate the layout. Layout 4 requires a fresh shared-memory name or recreation of the old name after every old participant has exited.
+## Creating and attaching
 
-Each endpoint owns a Linux open-file-description (OFD) byte-range lock on its slot. Independent endpoints in one process have separate file descriptions. The kernel releases ownership when the last descriptor for that description closes. Create endpoints after `fork()`. A child retaining an inherited endpoint descriptor also retains the lock and must not use the inherited endpoint. Pausing a process with `SIGSTOP` preserves its slot.
+The process that wins `shm_open(O_CREAT | O_EXCL)` sizes the object, applies
+`Options::mode` with `fchmod` (the umask would otherwise narrow it), constructs the
+region and publishes `READY` with a release store. Other processes wait up to
+`Options::initialization_timeout` for the expected size and for `READY`, then compare
+the magic, layout version (5), size and `Config` hash. A mismatch throws; nothing in the
+region is modified.
 
-The library creates zero background threads. A new subscriber can reuse an abandoned slot. `collect_garbage()` scans abandoned reader slots on demand and returns the count reclaimed by that call. Allocation also scans once under pool pressure before retrying. `get_valid_subscriber_count()` reflects registered, subscribed slots and can include exited readers until a scan or reuse. The pool-exhaustion path may perform system calls and serialize maintenance within one endpoint.
+If the creator dies before `READY`, attachers time out. Remove the name with
+`Topic<>::destroy(name)` and create it again. `Options::unlink_on_destroy` unlinks the
+name when that `Topic` object is destroyed; by default the region outlives every
+process, which is what lets a restarted process rejoin.
 
-Reclamation holds the slot lock, changes `ACTIVE` to `RECLAIMING`, and waits for a future scan if publishers still hold pins. Once the pin count reaches zero, reclamation drains queued broadcast references and marks the slot `FREE`. Graceful destruction uses the same path. Concurrent public calls and loans must finish before endpoint destruction. `stop()` wakes blocked receivers on that endpoint, allowing their caller to join before destruction. Detaching keeps the region by default.
+## Endpoints and liveness
 
-## Crash recovery boundary
+Every endpoint opens its own file descriptor for the region and holds a Linux
+open-file-description (OFD) write lock on one byte, its slot index. The kernel drops the
+lock when the last descriptor of that description closes, including on `SIGKILL`, so a
+slot whose byte can be locked by someone else belongs to a dead owner. No heartbeat or
+PID check is involved, so PID reuse cannot confuse it.
 
-Queued broadcast references are reclaimable after a subscriber exits, provided its queue and outstanding publisher pins are intact. A process killed while it holds a write loan or a dequeued read loan can leak a block. Death during a queue operation, pin or reference update, or free-list operation can strand a queue or slot or reduce pool capacity. These transitions have no crash journal. If the initializer dies before `READY`, attachments time out. To reset a damaged region, detach all participants and recreate it. Delivery is in-memory and at most once.
+- Create endpoints after `fork()`. A child that inherits an endpoint's descriptor also
+  keeps the lock alive and must not use the inherited endpoint.
+- `SIGSTOP` keeps a slot alive. A stopped process in the middle of an operation also
+  makes `recover()` report `kBusy` until it continues or dies.
+- Several endpoints in one process are independent; each has its own description.
+
+Slots carry a generation that changes on every reuse, and a per-slot activity word (see
+[crash consistency](crash-consistency.md)) whose counter never restarts.
+
+## Reclamation
+
+The library has no threads, so reclamation happens on demand:
+
+| Trigger | What runs |
+|---|---|
+| A new endpoint lands on a slot whose owner died | `reclaim_slot` for that slot. |
+| `Topic::collect_garbage()` | `reclaim_slot` for every dead slot; if any was reclaimed, one `recover()` attempt. Returns the number of slots reclaimed. |
+| `loan()` finds the pool empty | `collect_garbage()`, then `recover()`, then `kPoolExhausted`. |
+| `Topic::recover(&report)` | Full repair, see [crash consistency](crash-consistency.md). |
+
+Reclaiming a slot, while holding its lock byte:
+
+1. moves the lifecycle word from `ACTIVE` to `RECLAIMING`, so publishers stop pinning
+   it;
+2. for a subscriber slot, waits up to 100 ms for **live** publishers pinned on its queue
+   to leave (pins of dead publishers are cleared). If they do not, the slot stays
+   `RECLAIMING` and a later call finishes it;
+3. drains the private queue, releasing every queued reference, including cells that
+   were claimed but not yet released, and leaves the consumer group;
+4. for a publisher slot, clears its pins on every subscriber slot;
+5. clears the slot's holder bit on every block, releasing blocks held as loans, and
+   marks the slot `FREE`. The next owner bumps the generation.
+
+Every step is idempotent, so a reclaimer that is itself killed is finished by the next
+one. Graceful endpoint destruction uses the same path; destroy loans before their
+endpoint and endpoints before their `Topic`.
+
+A supervisor that restarts crashed workers should call `collect_garbage()` after a child
+exits (or periodically). `shmtop /name` shows dead slots as `live=no` before they are
+reclaimed.
+
+## Upgrading a region
+
+Layout 5 is incompatible with 0.2 (layout 4). Stop every 0.2 process, then
+`Topic<>::destroy(name)` or choose a new name. A `Config` change is also a layout change
+for this purpose: the hash check rejects it.

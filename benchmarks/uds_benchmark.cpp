@@ -26,6 +26,6 @@ int main(int argc, char** argv) {
           .count();
   close(fd[0]);
   close(fd[1]);
-  std::cout << "transport,message_bytes,messages,seconds,msg_per_sec,dropped\nuds," << bytes << ','
-            << count << ',' << ns / 1e9 << ',' << count / (ns / 1e9) << ",0\n";
+  std::cout << "transport,message_bytes,messages,seconds,msg_per_sec,dropped\nuds_dgram_2thread,"
+            << bytes << ',' << count << ',' << ns / 1e9 << ',' << count / (ns / 1e9) << ",0\n";
 }

@@ -1,10 +1,13 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
-#include "lock_free_list.h"
+#include "shm_pubsub/detail/lock_free_list.hpp"
+
+using shm_pubsub::detail::LockFreeFreeList;
 
 #undef assert
 #define assert(condition)           \
@@ -52,6 +55,15 @@ int main() {
   for (std::thread& thread : threads) thread.join();
   assert(!failed.load());
   for (size_t i = 0; i < 32; ++i) assert(!in_use[i].load());
+
+  size_t visited = 0;
+  assert(concurrent_list.for_each_free([&](uint32_t) { ++visited; }) && visited == 32);
+  uint32_t orphan = 0;
+  assert(concurrent_list.pop(orphan));
+  visited = 0;
+  assert(concurrent_list.for_each_free([&](uint32_t) { ++visited; }) && visited == 31);
+  assert(concurrent_list.force_push(orphan));
+  assert(!concurrent_list.push(orphan));
 
   return 0;
 }

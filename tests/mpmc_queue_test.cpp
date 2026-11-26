@@ -1,11 +1,15 @@
+#include "shm_pubsub/detail/mpmc_queue.hpp"
+
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
-#include "shm_pubsub.h"
+constexpr uint32_t QUEUE_CAPACITY = 32;
+using AtomicQueue = shm_pubsub::detail::MpmcQueue<QUEUE_CAPACITY>;
 
 #undef assert
 #define assert(condition)           \
@@ -17,26 +21,32 @@ int main() {
   AtomicQueue queue;
   queue.init();
 
-  size_t value = 0;
-  assert(!queue.dequeue(value));
+  uint32_t value = 0;
+  assert(!queue.try_dequeue(value));
 
   for (size_t i = 0; i < QUEUE_CAPACITY; ++i) {
-    assert(queue.enqueue(i));
+    assert(queue.try_enqueue(static_cast<uint32_t>(i)));
   }
-  assert(!queue.enqueue(QUEUE_CAPACITY));
-  assert(queue.contains(0));
-  assert(queue.contains(QUEUE_CAPACITY - 1));
-  assert(!queue.contains(QUEUE_CAPACITY));
+  assert(!queue.try_enqueue(QUEUE_CAPACITY));
+  assert(queue.size_approx() == QUEUE_CAPACITY && queue.head_ready());
 
   for (size_t i = 0; i < QUEUE_CAPACITY; ++i) {
-    assert(queue.dequeue(value));
+    assert(queue.try_dequeue(value));
     assert(value == i);
   }
-  assert(!queue.dequeue(value));
+  assert(!queue.try_dequeue(value));
 
-  assert(queue.enqueue(42));
-  queue.clear();
-  assert(!queue.dequeue(value));
+  // A claimed cell stays unusable until released.
+  assert(queue.try_enqueue(42));
+  uint64_t pos = 0;
+  assert(queue.try_claim(pos, value) && value == 42);
+  for (uint32_t i = 0; i + 1 < QUEUE_CAPACITY; ++i)
+    assert(queue.try_enqueue(static_cast<uint32_t>(i)));
+  assert(!queue.try_enqueue(7));
+  queue.release(pos);
+  assert(queue.try_enqueue(7));
+  while (queue.try_dequeue(value)) {
+  }
 
   queue.init();
   const size_t producer_count = 4;
@@ -53,7 +63,7 @@ int main() {
     threads.emplace_back([&queue, p]() {
       const size_t base = p * items_per_producer;
       for (size_t i = 0; i < items_per_producer; ++i) {
-        while (!queue.enqueue(base + i)) {
+        while (!queue.try_enqueue(static_cast<uint32_t>(base + i))) {
           std::this_thread::yield();
         }
       }
@@ -61,10 +71,10 @@ int main() {
   }
 
   for (size_t c = 0; c < consumer_count; ++c) {
-    threads.emplace_back([&queue, &consumed, &sum, total_items]() {
-      size_t item = 0;
+    threads.emplace_back([&queue, &consumed, &sum]() {
+      uint32_t item = 0;
       while (consumed.load(std::memory_order_acquire) < total_items) {
-        if (queue.dequeue(item)) {
+        if (queue.try_dequeue(item)) {
           sum.fetch_add(item, std::memory_order_acq_rel);
           consumed.fetch_add(1, std::memory_order_acq_rel);
         } else {
@@ -80,7 +90,7 @@ int main() {
 
   assert(consumed.load() == total_items);
   assert(sum.load() == expected_sum);
-  assert(!queue.dequeue(value));
+  assert(!queue.try_dequeue(value));
 
   return 0;
 }
