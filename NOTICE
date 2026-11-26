@@ -1,0 +1,12 @@
+shm_pubsub
+Copyright (c) 2026 shm_pubsub contributors
+Licensed under the MIT License (see LICENSE).
+
+This product includes software adapted from Eclipse iceoryx
+(https://github.com/eclipse-iceoryx/iceoryx):
+
+  include/shm_pubsub/detail/lock_free_list.hpp
+    Adapted from iceoryx MpmcLoFFLi.
+    Copyright (c) 2019 by Robert Bosch GmbH. All rights reserved.
+    Copyright (c) 2021 - 2022 by Apex.AI Inc. All rights reserved.
+    Licensed under Apache-2.0 OR MIT.
