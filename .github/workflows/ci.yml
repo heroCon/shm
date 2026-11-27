@@ -71,12 +71,34 @@ jobs:
       - run: curl -fsSL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.3/tla2tools.jar
       - run: java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -deadlock -workers 2 -config spec/ShmPubsub.cfg spec/ShmPubsub.tla
 
+  bindings:
+    name: c python package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHM_PUBSUB_BUILD_C=ON
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure -R 'c_api_test|typed_test|io_uring_test'
+      - run: pip install pytest && PYTHONPATH=bindings/python python3 -m pytest bindings/python/tests
+      - name: Amalgamation is current
+        run: python3 scripts/amalgamate.py && git diff --exit-code single_include/shm_pubsub.hpp
+      - name: Conan
+        run: |
+          pip install conan
+          conan profile detect --force
+          conan create . --build=missing
+      - name: vcpkg overlay
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git /tmp/vcpkg
+          /tmp/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          /tmp/vcpkg/vcpkg install shm-pubsub --overlay-ports="$PWD/ports"
+
   format:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y clang-format-18
-      - run: git ls-files '*.cpp' '*.hpp' '*.h' | xargs clang-format-18 --dry-run --Werror
+      - run: git ls-files '*.cpp' '*.hpp' '*.h' | grep -v '^single_include/' | xargs clang-format-18 --dry-run --Werror
 
   package:
     runs-on: ubuntu-24.04

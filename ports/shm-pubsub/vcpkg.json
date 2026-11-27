@@ -1,0 +1,7 @@
+{
+  "name": "shm-pubsub",
+  "version": "0.4.0",
+  "description": "Header-only crash-consistent shared-memory pub/sub for Linux",
+  "license": "MIT",
+  "supports": "linux"
+}

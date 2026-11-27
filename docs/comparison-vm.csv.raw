@@ -1,0 +1,4 @@
+transport,mode,message_bytes,messages,p50_us,p99_us,p999_us,max_us
+shm,futex,64,2000,3.937,5.245,15.845,154.132
+iceoryx2 skipped: set ICEORYX2_PUBSUB to its publish-subscribe benchmark
+eCAL skipped: set ECAL_LATENCY to its latency sample

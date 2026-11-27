@@ -47,6 +47,11 @@ share a region. Source changes are small: see the migration notes below.
   `Overflow::kBlock` with `publish(loan, timeout)`.
 - Optional `Config::kLargeBlockCount` / `kLargeBlockSize`, a second free list.
   `loan()` picks the smallest class that fits.
+- `TypedPublisher` / `TypedSubscriber`, `EventfdBridge` for epoll loops, and
+  `prepare_futex_wait` for `IORING_OP_FUTEX_WAIT` (Linux 6.7+).
+- A C API (`libshm_pubsub_c`) and a ctypes Python package with zero-copy loans.
+- `scripts/amalgamate.py`, a Conan 2 recipe and a vcpkg overlay port.
+- `spec/ShmPubsub.tla`, checked by TLC in CI.
 - `Publisher::publish(WriteLoan*, n)`, `Subscriber::take(ReadLoan*, n)` and
   `Subscriber::drain(fn, max)`.
 - `membership_test`, `slot_contention_test`, `control_path_benchmark`, and
