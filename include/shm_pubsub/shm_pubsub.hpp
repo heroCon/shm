@@ -46,9 +46,6 @@ struct DefaultConfig {
   static constexpr uint32_t kMaxLoansPerPublisher = 2;
   static constexpr uint32_t kMaxLoansPerSubscriber = 2;
   static constexpr bool kTimestamps = true;  // stamp CLOCK_MONOTONIC on every publish
-  // Blocks each publisher may keep for reuse instead of returning them to the
-  // shared free list. Counted in the pool budget.
-  static constexpr uint32_t kPublisherCache = 0;
 };
 
 struct Options {
@@ -85,7 +82,6 @@ class Topic {
   static constexpr uint32_t kMaxGroups = Config::kMaxGroups;
   static constexpr uint32_t kMaxLoansPerPublisher = Config::kMaxLoansPerPublisher;
   static constexpr uint32_t kMaxLoansPerSubscriber = Config::kMaxLoansPerSubscriber;
-  static constexpr uint32_t kPublisherCache = Config::kPublisherCache;
   static constexpr uint32_t kLoanEntries = detail::loan_entries<Config>();
   static constexpr uint32_t kSlots = kMaxPublishers + kMaxSubscribers;
   static constexpr size_t kMaxPayload = kBlockSize - sizeof(detail::BlockHeader);
@@ -94,7 +90,7 @@ class Topic {
   static constexpr uint64_t kRequiredBlocks =
       static_cast<uint64_t>(kMaxSubscribers + kMaxGroups) * kQueueCapacity +
       static_cast<uint64_t>(kMaxSubscribers) * kMaxLoansPerSubscriber +
-      static_cast<uint64_t>(kMaxPublishers) * (kMaxLoansPerPublisher + kPublisherCache);
+      static_cast<uint64_t>(kMaxPublishers) * kMaxLoansPerPublisher;
 
   static_assert(kBlockSize % 64 == 0 && kBlockSize > sizeof(detail::BlockHeader),
                 "kBlockSize must be a multiple of 64 larger than the block header");
@@ -110,8 +106,7 @@ class Topic {
   static_assert(kMaxLoansPerPublisher >= 1 && kMaxLoansPerSubscriber >= 1,
                 "endpoints need at least one loan");
   static_assert(kBlockCount >= kRequiredBlocks,
-                "kBlockCount must cover (subscribers + groups) * queue capacity plus all loans "
-                "and publisher caches");
+                "kBlockCount must cover (subscribers + groups) * queue capacity plus all loans");
 
   class Publisher;
   class Subscriber;
@@ -235,99 +230,33 @@ class Topic {
 
     // Consumes the loan whenever it belongs to this publisher.
     PublishResult publish(WriteLoan&& sample) {
-      PublishResult r = {Status::kOk, 0, 0, 0};
       if (sample.owner_ != this) {
-        r.status = Status::kInvalidArgument;
+        PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
         return r;
       }
       const uint32_t id = sample.id_;
       sample.owner_ = nullptr;
-      auto& slot = topic_->slot(slot_);
-      detail::BlockHeader& h = topic_->header(id);
-      const uint64_t seq = slot.next_sequence.load(std::memory_order_relaxed);
-      slot.next_sequence.store(seq + 1, std::memory_order_relaxed);
-      h.sequence = seq;
-      h.timestamp_ns = Config::kTimestamps ? detail::monotonic_ns() : 0;
-      h.publisher = slot_;
-
-      begin(detail::kOpPublish, id);
-      detail::WakeWord* wake[kMaxSubscribers + kMaxGroups];
-      bool wake_all[kMaxSubscribers + kMaxGroups];
-      uint32_t wakes = 0;
-      uint64_t targets = 0;
-      for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
-        const auto& s = topic_->slot(j);
-        if (detail::lifecycle_state(s.lifecycle.load(std::memory_order_relaxed)) ==
-                detail::kSlotActive &&
-            s.subscribed.load(std::memory_order_relaxed) &&
-            s.group.load(std::memory_order_relaxed) == 0) {
-          targets |= member_bit(j);
-        }
-      }
-      if (targets) {
-        slot.pinned.store(targets, std::memory_order_relaxed);
-        // Pairs with the fence in reclaim_slot(): either this publisher sees
-        // the slot leave ACTIVE, or the reclaimer sees its pin and waits.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        for (uint64_t pending = targets; pending; pending &= pending - 1) {
-          const uint32_t j = kMaxPublishers + static_cast<uint32_t>(__builtin_ctzll(pending));
-          auto& s = topic_->slot(j);
-          if (detail::lifecycle_state(s.lifecycle.load(std::memory_order_acquire)) !=
-                  detail::kSlotActive ||
-              !s.subscribed.load(std::memory_order_acquire) ||
-              s.group.load(std::memory_order_relaxed) != 0) {
-            continue;
-          }
-          ++r.targets;
-          const Overflow overflow =
-              static_cast<Overflow>(s.overflow.load(std::memory_order_relaxed));
-          if (deliver(s.queue, id, overflow, s.stats.dropped_newest, s.stats.dropped_oldest, r)) {
-            ++r.delivered;
-            wake[wakes] = &s.queue.wake;
-            wake_all[wakes++] = true;
-          }
-        }
-        slot.pinned.store(0, std::memory_order_release);
-      }
-      for (uint32_t g = 1; g <= kMaxGroups; ++g) {
-        auto& group = topic_->group(g);
-        if (group.member_mask.load(std::memory_order_acquire) == 0) continue;
-        ++r.targets;
-        const Overflow overflow = static_cast<Overflow>(
-            detail::policy_overflow(group.policy.load(std::memory_order_relaxed)));
-        if (deliver(group.queue, id, overflow, group.dropped_newest, group.dropped_oldest, r)) {
-          ++r.delivered;
-          wake[wakes] = &group.queue.wake;
-          wake_all[wakes++] = false;
-        }
-      }
-      SHM_PUBSUB_FAULT_POINT("publish.before_release");
-      drop_own(id);
-      --held_;
-      slot.stats.held_loans.store(held_, std::memory_order_relaxed);
-      if (wakes) {
-        // Pairs with the fence in wait_take(): either the waiter sees the
-        // queued cell, or this load sees the waiter and wakes it.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        for (uint32_t i = 0; i < wakes; ++i) {
-          if (wake[i]->waiters.load(std::memory_order_relaxed) == 0) continue;
-          wake[i]->generation.fetch_add(1, std::memory_order_release);
-          detail::futex_wake(&wake[i]->generation, wake_all[i] ? INT_MAX : 1);
-        }
-      }
-      end();
-      slot.stats.published.store(slot.stats.published.load(std::memory_order_relaxed) + 1,
-                                 std::memory_order_relaxed);
-      if (r.targets == 0) {
-        r.status = Status::kNoSubscribers;
-      } else if (r.delivered == 0) {
-        r.status = Status::kQueueFull;
-      } else if (r.delivered < r.targets) {
-        r.status = Status::kPartial;
-      }
-      return r;
+      return publish_ids(&id, 1);
     }
 
+    // Publishes up to kMaxLoansPerPublisher loans in order with one pin pass,
+    // one fence and at most one wake-up per queue. Counts in the result are
+    // summed over the messages. Nothing is consumed unless every loan
+    // belongs to this publisher.
+    PublishResult publish(WriteLoan* samples, size_t count) {
+      PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
+      if (!samples || count == 0 || count > kMaxLoansPerPublisher) return r;
+      uint32_t ids[kMaxLoansPerPublisher];
+      for (size_t k = 0; k < count; ++k) {
+        if (samples[k].owner_ != this) return r;
+        for (size_t m = 0; m < k; ++m) {
+          if (samples[m].id_ == samples[k].id_) return r;
+        }
+        ids[k] = samples[k].id_;
+      }
+      for (size_t k = 0; k < count; ++k) samples[k].owner_ = nullptr;
+      return publish_ids(ids, count);
+    }
     PublishResult publish_copy(const void* data, size_t size) {
       PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
       if (!data || size == 0) return r;
@@ -357,23 +286,117 @@ class Topic {
     void begin(uint32_t op, uint32_t id) { topic_->begin_activity(slot_, counter_, op, id); }
     void end() { topic_->end_activity(slot_, counter_); }
 
+    PublishResult publish_ids(const uint32_t* ids, size_t count) {
+      PublishResult r = {Status::kOk, 0, 0, 0};
+      auto& slot = topic_->slot(slot_);
+      uint64_t seq = slot.next_sequence.load(std::memory_order_relaxed);
+      const uint64_t now = Config::kTimestamps ? detail::monotonic_ns() : 0;
+      for (size_t k = 0; k < count; ++k) {
+        detail::BlockHeader& h = topic_->header(ids[k]);
+        h.sequence = seq++;
+        h.timestamp_ns = now;
+        h.publisher = slot_;
+      }
+      slot.next_sequence.store(seq, std::memory_order_relaxed);
+
+      uint64_t targets = 0;
+      for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
+        const auto& s = topic_->slot(j);
+        if (detail::lifecycle_state(s.lifecycle.load(std::memory_order_relaxed)) ==
+                detail::kSlotActive &&
+            s.subscribed.load(std::memory_order_relaxed) &&
+            s.group.load(std::memory_order_relaxed) == 0) {
+          targets |= member_bit(j);
+        }
+      }
+      if (targets) {
+        slot.pinned.store(targets, std::memory_order_relaxed);
+        // Pairs with the fence in reclaim_slot(): either this publisher sees
+        // the slot leave ACTIVE, or the reclaimer sees its pin and waits.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (uint64_t pending = targets; pending; pending &= pending - 1) {
+          const uint32_t j = kMaxPublishers + static_cast<uint32_t>(__builtin_ctzll(pending));
+          const auto& s = topic_->slot(j);
+          if (detail::lifecycle_state(s.lifecycle.load(std::memory_order_acquire)) !=
+                  detail::kSlotActive ||
+              !s.subscribed.load(std::memory_order_acquire) ||
+              s.group.load(std::memory_order_relaxed) != 0) {
+            targets &= ~member_bit(j);
+          }
+        }
+      }
+      uint64_t woken = 0;
+      uint32_t group_wakes[kMaxGroups + 1] = {};
+      for (size_t k = 0; k < count; ++k) {
+        const uint32_t id = ids[k];
+        begin(detail::kOpPublish, id);
+        for (uint64_t pending = targets; pending; pending &= pending - 1) {
+          const uint32_t j = kMaxPublishers + static_cast<uint32_t>(__builtin_ctzll(pending));
+          auto& s = topic_->slot(j);
+          ++r.targets;
+          const Overflow overflow =
+              static_cast<Overflow>(s.overflow.load(std::memory_order_relaxed));
+          if (deliver(s.queue, id, overflow, s.stats.dropped_newest, s.stats.dropped_oldest, r)) {
+            ++r.delivered;
+            woken |= member_bit(j);
+          }
+        }
+        for (uint32_t g = 1; g <= kMaxGroups; ++g) {
+          auto& group = topic_->group(g);
+          if (group.member_mask.load(std::memory_order_acquire) == 0) continue;
+          ++r.targets;
+          const Overflow overflow = static_cast<Overflow>(
+              detail::policy_overflow(group.policy.load(std::memory_order_relaxed)));
+          if (deliver(group.queue, id, overflow, group.dropped_newest, group.dropped_oldest, r)) {
+            ++r.delivered;
+            ++group_wakes[g];
+          }
+        }
+        SHM_PUBSUB_FAULT_POINT("publish.before_release");
+        drop_own(id);
+        end();
+      }
+      if (targets) slot.pinned.store(0, std::memory_order_release);
+      held_ -= static_cast<uint32_t>(count);
+      slot.stats.held_loans.store(held_, std::memory_order_relaxed);
+      // Pairs with the fence in wait_take(): either the waiter sees the
+      // queued cell, or this load sees the waiter and wakes it.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      for (uint64_t pending = woken; pending; pending &= pending - 1) {
+        const uint32_t j = kMaxPublishers + static_cast<uint32_t>(__builtin_ctzll(pending));
+        wake(topic_->slot(j).queue.wake, INT_MAX);
+      }
+      for (uint32_t g = 1; g <= kMaxGroups; ++g) {
+        if (group_wakes[g]) wake(topic_->group(g).queue.wake, static_cast<int>(group_wakes[g]));
+      }
+      slot.stats.published.store(slot.stats.published.load(std::memory_order_relaxed) + count,
+                                 std::memory_order_relaxed);
+      if (r.targets == 0) {
+        r.status = Status::kNoSubscribers;
+      } else if (r.delivered == 0) {
+        r.status = Status::kQueueFull;
+      } else if (r.delivered < r.targets) {
+        r.status = Status::kPartial;
+      }
+      return r;
+    }
+
+    static void wake(detail::WakeWord& w, int count) {
+      if (w.waiters.load(std::memory_order_relaxed) == 0) return;
+      w.generation.fetch_add(1, std::memory_order_release);
+      detail::futex_wake(&w.generation, count);
+    }
+
     bool try_loan(size_t size, uint32_t& id) {
       begin(detail::kOpLoan, detail::kNoBlock);
-      detail::BlockHeader* hp;
-      if (cached_) {
-        id = cache_[--cached_];
-        hp = &topic_->header(id);
-      } else {
-        if (!topic_->region_->free_list.pop(id)) {
-          end();
-          return false;
-        }
-        SHM_PUBSUB_FAULT_POINT("loan.after_pop");
-        topic_->record_loan(slot_, id);
-        hp = &topic_->header(id);
-        hp->state.store(1ULL << slot_, std::memory_order_release);
+      if (!topic_->region_->free_list.pop(id)) {
+        end();
+        return false;
       }
-      detail::BlockHeader& h = *hp;
+      SHM_PUBSUB_FAULT_POINT("loan.after_pop");
+      topic_->record_loan(slot_, id);
+      detail::BlockHeader& h = topic_->header(id);
+      h.state.store(1ULL << slot_, std::memory_order_release);
       h.size = static_cast<uint32_t>(size);
       h.publisher = slot_;
       SHM_PUBSUB_FAULT_POINT("loan.after_claim");
@@ -404,7 +427,7 @@ class Topic {
           // subscriber treats an unreleased claimed cell as still referenced.
           queue.release(pos);
           SHM_PUBSUB_FAULT_POINT("drop_oldest.after_release_cell");
-          if (old < kBlockCount) adopt_or_release(old);
+          if (old < kBlockCount) topic_->release_bits(old, detail::kQueueUnit);
           dropped_oldest.fetch_add(1, std::memory_order_relaxed);
           ++r.dropped_oldest;
         }
@@ -422,32 +445,9 @@ class Topic {
       topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
     }
 
-    // Drops this publisher's bit, or keeps the block in the cache when the
-    // bit is its only reference.
     void drop_own(uint32_t id) {
-      const uint64_t own = 1ULL << slot_;
-      if (cached_ < kPublisherCache &&
-          topic_->header(id).state.load(std::memory_order_acquire) == own) {
-        cache_[cached_++] = id;
-        return;
-      }
-      topic_->release_bits(id, own);
+      topic_->release_bits(id, 1ULL << slot_);
       topic_->forget_loan(slot_, id);
-    }
-
-    // Takes over a dropped block whose last reference was the queue cell.
-    void adopt_or_release(uint32_t id) {
-      if (cached_ < kPublisherCache) {
-        topic_->record_loan(slot_, id);
-        uint64_t expected = detail::kQueueUnit;
-        if (topic_->header(id).state.compare_exchange_strong(expected, 1ULL << slot_,
-                                                             std::memory_order_acq_rel)) {
-          cache_[cached_++] = id;
-          return;
-        }
-        topic_->forget_loan(slot_, id);
-      }
-      topic_->release_bits(id, detail::kQueueUnit);
     }
 
     Topic* topic_;
@@ -455,8 +455,6 @@ class Topic {
     uint32_t slot_ = 0;
     uint32_t held_ = 0;
     uint64_t counter_ = 0;
-    uint32_t cache_[kPublisherCache ? kPublisherCache : 1];
-    uint32_t cached_ = 0;
   };
 
   // A subscriber endpoint. Not thread-safe except for stop(), which any
@@ -565,6 +563,28 @@ class Topic {
         out.id_ = id;
         return Status::kOk;
       }
+    }
+
+    // Takes up to `count` messages (bounded by the loan limit) into empty
+    // loans and returns how many were taken.
+    size_t take(ReadLoan* out, size_t count) {
+      size_t n = 0;
+      while (n < count && take(out[n]) == Status::kOk) ++n;
+      return n;
+    }
+
+    // Takes up to `max` messages one at a time, calls fn(const ReadLoan&)
+    // for each and releases it before the next. Returns how many were taken.
+    template <class F>
+    size_t drain(F&& fn, size_t max = static_cast<size_t>(-1)) {
+      size_t n = 0;
+      while (n < max) {
+        ReadLoan sample;
+        if (take(sample) != Status::kOk) break;
+        fn(static_cast<const ReadLoan&>(sample));
+        ++n;
+      }
+      return n;
     }
 
     Status wait_take(ReadLoan& out, std::chrono::milliseconds timeout) {
@@ -1411,8 +1431,6 @@ template <class C>
 constexpr uint32_t Topic<C>::kMaxLoansPerPublisher;
 template <class C>
 constexpr uint32_t Topic<C>::kMaxLoansPerSubscriber;
-template <class C>
-constexpr uint32_t Topic<C>::kPublisherCache;
 template <class C>
 constexpr uint32_t Topic<C>::kLoanEntries;
 template <class C>

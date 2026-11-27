@@ -152,8 +152,8 @@ struct alignas(64) GroupRecord {
 
 template <class Config>
 constexpr uint32_t loan_entries() {
-  return Config::kMaxLoansPerPublisher + Config::kPublisherCache > Config::kMaxLoansPerSubscriber
-             ? Config::kMaxLoansPerPublisher + Config::kPublisherCache
+  return Config::kMaxLoansPerPublisher > Config::kMaxLoansPerSubscriber
+             ? Config::kMaxLoansPerPublisher
              : Config::kMaxLoansPerSubscriber;
 }
 
@@ -200,7 +200,6 @@ uint64_t config_hash() {
   h = fnv_mix(h, Config::kMaxLoansPerPublisher);
   h = fnv_mix(h, Config::kMaxLoansPerSubscriber);
   h = fnv_mix(h, Config::kTimestamps ? 1 : 0);
-  h = fnv_mix(h, Config::kPublisherCache);
   h = fnv_mix(h, sizeof(Region<Config>));
   h = fnv_mix(h, sizeof(Slot<Config::kQueueCapacity, loan_entries<Config>()>));
   h = fnv_mix(h, alignof(Region<Config>));
