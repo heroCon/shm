@@ -209,6 +209,9 @@ struct Region {
   // collect_garbage() or exhausted loan runs recover() and clears it.
   std::atomic<uint32_t> repair_pending;
   alignas(64) LockFreeFreeList<uint32_t, Config::kBlockCount> free_list;
+  // Large class; unused (and never initialized) when kLargeBlockCount is 0.
+  alignas(64) LockFreeFreeList<uint32_t, (Config::kLargeBlockCount > 0 ? Config::kLargeBlockCount
+                                                                       : 1)> large_free_list;
   Slot<Config::kQueueCapacity, loan_entries<Config>()>
       slots[Config::kMaxPublishers + Config::kMaxSubscribers];
   GroupRecord<Config::kQueueCapacity> groups[Config::kMaxGroups + 1];
@@ -228,6 +231,8 @@ uint64_t config_hash() {
   h = fnv_mix(h, kLayoutVersion);
   h = fnv_mix(h, Config::kBlockCount);
   h = fnv_mix(h, Config::kBlockSize);
+  h = fnv_mix(h, Config::kLargeBlockCount);
+  h = fnv_mix(h, Config::kLargeBlockSize);
   h = fnv_mix(h, Config::kQueueCapacity);
   h = fnv_mix(h, Config::kMaxPublishers);
   h = fnv_mix(h, Config::kMaxSubscribers);
@@ -249,7 +254,8 @@ constexpr size_t blocks_offset() {
 
 template <class Config>
 constexpr size_t region_size() {
-  return blocks_offset<Config>() + static_cast<size_t>(Config::kBlockCount) * Config::kBlockSize;
+  return blocks_offset<Config>() + static_cast<size_t>(Config::kBlockCount) * Config::kBlockSize +
+         static_cast<size_t>(Config::kLargeBlockCount) * Config::kLargeBlockSize;
 }
 
 }  // namespace detail

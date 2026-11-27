@@ -37,6 +37,10 @@ static void print(const std::string& name, const Topic::Snapshot& snap) {
               snap.layout_version, static_cast<unsigned long long>(snap.config_hash),
               snap.free_blocks, snap.block_count, snap.block_size,
               snap.free_list_consistent ? "" : "  FREE LIST INCONSISTENT");
+  if (snap.large_block_count) {
+    std::printf("  large blocks free %u/%u (%u bytes each)\n", snap.large_free_blocks,
+                snap.large_block_count, snap.large_block_size);
+  }
   std::printf("%-4s %-4s %-7s %-4s %-7s %-5s %-6s %-6s %-5s %-10s %-10s %-10s %-10s %-12s\n",
               "slot", "kind", "state", "live", "pid", "group", "subscr", "queue", "loans",
               "published", "taken", "drop_new", "drop_old", "in_flight");

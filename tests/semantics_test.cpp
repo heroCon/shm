@@ -199,6 +199,58 @@ static void check_no_timestamps() {
   CHECK(sub.take(loan) == Status::kOk && loan.timestamp_ns() == 0);
 }
 
+struct LargeConfig : SmallConfig {
+  static constexpr uint32_t kLargeBlockCount = 4;
+  static constexpr uint32_t kLargeBlockSize = 16384;
+};
+
+// Loans take the smallest class that fits; the classes have separate pools.
+static void check_size_classes() {
+  using Large = shm_pubsub::Topic<LargeConfig>;
+  ScopedName name("semantics_large");
+  shm_pubsub::Options o;
+  o.name = name.name;
+  Large topic(o);
+  Large::Publisher pub(topic);
+  Large::Subscriber sub(topic);
+  CHECK(Large::max_payload_size() == Large::kMaxLargePayload);
+  CHECK(Large::kMaxLargePayload > Large::kMaxPayload);
+  Large::WriteLoan small, big;
+  CHECK(pub.loan(Large::kMaxPayload, small) == Status::kOk);
+  CHECK(small.capacity() == Large::kMaxPayload);
+  CHECK(pub.loan(Large::kMaxPayload + 1, big) == Status::kOk);
+  CHECK(big.capacity() == Large::kMaxLargePayload);
+  CHECK(big.resize(Large::kMaxLargePayload) && !small.resize(Large::kMaxPayload + 1));
+  std::memset(big.data(), 'L', big.size());
+  small.reset();
+  CHECK(pub.publish(std::move(big)).ok());
+  Large::ReadLoan loan;
+  CHECK(sub.take(loan) == Status::kOk);
+  CHECK(loan.size() == Large::kMaxLargePayload && loan.data()[loan.size() - 1] == 'L');
+  loan.reset();
+
+  std::vector<char> payload(Large::kMaxLargePayload, 'p');
+  uint32_t published = 0;
+  for (uint32_t i = 0; i < Large::kLargeBlockCount + 2; ++i) {
+    published += pub.publish_copy(payload.data(), payload.size()).ok();
+  }
+  CHECK(published == Large::kLargeBlockCount);
+  CHECK(topic.snapshot().large_free_blocks == 0);
+  CHECK(pub.publish_copy("x", 1).status == Status::kQueueFull);
+  CHECK(pub.publish_copy(nullptr, Large::kMaxLargePayload + 1).status == Status::kInvalidArgument);
+  uint32_t taken = 0;
+  while (sub.take(loan) == Status::kOk) {
+    taken += loan.size() == payload.size();
+    loan.reset();
+  }
+  CHECK(taken == Large::kLargeBlockCount);
+  shm_pubsub::RecoveryReport report;
+  CHECK(topic.recover(&report) == Status::kOk && report.inconsistencies == 0);
+  const auto snap = topic.snapshot();
+  CHECK(snap.free_blocks == Large::kBlockCount &&
+        snap.large_free_blocks == Large::kLargeBlockCount);
+}
+
 // An idle reader that busy-polls must not keep recover() from running.
 static void check_recover_with_busy_poller(Topic& topic) {
   Topic::Subscriber sub(topic);
@@ -238,6 +290,7 @@ int main() {
     CHECK(threw);
   }
   check_no_timestamps();
+  check_size_classes();
   bool threw = false;
   try {
     shm_pubsub::Options bad;

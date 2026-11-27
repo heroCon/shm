@@ -46,6 +46,11 @@ struct DefaultConfig {
   static constexpr uint32_t kMaxLoansPerPublisher = 2;
   static constexpr uint32_t kMaxLoansPerSubscriber = 2;
   static constexpr bool kTimestamps = true;  // stamp CLOCK_MONOTONIC on every publish
+  // Optional second pool for payloads that do not fit kBlockSize. Loans pick
+  // the smallest class that fits; the large class is outside the
+  // no-exhaustion guarantee unless it alone meets kRequiredBlocks.
+  static constexpr uint32_t kLargeBlockCount = 0;
+  static constexpr uint32_t kLargeBlockSize = 0;
 };
 
 struct Options {
@@ -101,6 +106,12 @@ class Topic {
   static constexpr uint32_t kLoanEntries = detail::loan_entries<Config>();
   static constexpr uint32_t kSlots = kMaxPublishers + kMaxSubscribers;
   static constexpr size_t kMaxPayload = kBlockSize - sizeof(detail::BlockHeader);
+  static constexpr uint32_t kLargeBlockCount = Config::kLargeBlockCount;
+  static constexpr uint32_t kLargeBlockSize = Config::kLargeBlockSize;
+  // Block ids at or above kBlockCount index the large class.
+  static constexpr uint32_t kBlockIds = kBlockCount + kLargeBlockCount;
+  static constexpr size_t kMaxLargePayload =
+      kLargeBlockCount ? kLargeBlockSize - sizeof(detail::BlockHeader) : 0;
   // Every reference a block can have is bounded, so a pool of this size can
   // never be exhausted by slow or stalled subscribers.
   static constexpr uint64_t kRequiredBlocks =
@@ -110,7 +121,10 @@ class Topic {
 
   static_assert(kBlockSize % 64 == 0 && kBlockSize > sizeof(detail::BlockHeader),
                 "kBlockSize must be a multiple of 64 larger than the block header");
-  static_assert(kBlockCount >= 1 && kBlockCount < detail::kNoBlock, "kBlockCount out of range");
+  static_assert(kBlockCount >= 1 && kBlockIds < detail::kNoBlock, "kBlockCount out of range");
+  static_assert(kLargeBlockCount == 0 ||
+                    (kLargeBlockSize % 64 == 0 && kLargeBlockSize > kBlockSize),
+                "kLargeBlockSize must be a multiple of 64 larger than kBlockSize");
   static_assert(kMaxPublishers >= 1, "kMaxPublishers must be at least 1");
   static_assert(kMaxSubscribers >= 1, "kMaxSubscribers must be at least 1");
   static_assert(kSlots <= detail::kMaxHolderBits, "at most 56 endpoints per topic");
@@ -149,9 +163,10 @@ class Topic {
     explicit operator bool() const { return owner_ != nullptr; }
     char* data() { return owner_ ? owner_->topic_->payload(id_) : nullptr; }
     size_t size() const { return owner_ ? owner_->topic_->header(id_).size : 0; }
-    static constexpr size_t capacity() { return kMaxPayload; }
+    // Payload bytes this loan's block holds (depends on its size class).
+    size_t capacity() const { return owner_ ? owner_->topic_->payload_capacity(id_) : 0; }
     bool resize(size_t size) {
-      if (!owner_ || size == 0 || size > kMaxPayload) return false;
+      if (!owner_ || size == 0 || size > capacity()) return false;
       owner_->topic_->header(id_).size = static_cast<uint32_t>(size);
       return true;
     }
@@ -245,7 +260,7 @@ class Topic {
 
     Status loan(size_t size, WriteLoan& out) {
       if (out || size == 0) return Status::kInvalidArgument;
-      if (size > kMaxPayload) return Status::kMessageTooLarge;
+      if (size > max_payload_size()) return Status::kMessageTooLarge;
       if (held_ >= kMaxLoansPerPublisher) return Status::kLoanLimit;
       uint32_t id;
       if (!try_loan(size, id)) {
@@ -307,7 +322,7 @@ class Topic {
     PublishResult publish_copy(const void* data, size_t size) {
       PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
       if (!data || size == 0) return r;
-      if (size > kMaxPayload) {
+      if (size > max_payload_size()) {
         r.status = Status::kMessageTooLarge;
         return r;
       }
@@ -517,7 +532,7 @@ class Topic {
 
     bool try_loan(size_t size, uint32_t& id) {
       begin(detail::kOpLoan, detail::kNoBlock);
-      if (!topic_->region_->free_list.pop(id)) {
+      if (!topic_->pop_free(size, id)) {
         end();
         return false;
       }
@@ -562,7 +577,7 @@ class Topic {
           // subscriber treats an unreleased claimed cell as still referenced.
           queue.release(pos);
           SHM_PUBSUB_FAULT_POINT("drop_oldest.after_release_cell");
-          if (old < kBlockCount) topic_->release_bits(old, detail::kQueueUnit);
+          if (old < kBlockIds) topic_->release_bits(old, detail::kQueueUnit);
           dropped_oldest.fetch_add(1, std::memory_order_relaxed);
           ++r.dropped_oldest;
         }
@@ -688,7 +703,7 @@ class Topic {
           continue;
         }
         const uint32_t id = detail::cell_block(cell);
-        if (id >= kBlockCount) {
+        if (id >= kBlockIds) {
           queue.release(pos);
           end();
           return Status::kCorrupted;
@@ -707,7 +722,8 @@ class Topic {
         stats.held_loans.store(held_, std::memory_order_relaxed);
         stats.taken.store(stats.taken.load(std::memory_order_relaxed) + 1,
                           std::memory_order_relaxed);
-        if (topic_->header(id).size == 0 || topic_->header(id).size > kMaxPayload) {
+        if (topic_->header(id).size == 0 ||
+            topic_->header(id).size > topic_->payload_capacity(id)) {
           release_loan(id);
           return Status::kCorrupted;
         }
@@ -926,6 +942,9 @@ class Topic {
     uint32_t block_size = 0;
     uint32_t queue_capacity = 0;
     uint32_t free_blocks = 0;
+    uint32_t large_block_count = 0;
+    uint32_t large_block_size = 0;
+    uint32_t large_free_blocks = 0;
     bool free_list_consistent = true;
     std::vector<SlotInfo> slots;
     std::vector<GroupInfo> groups;
@@ -945,7 +964,10 @@ class Topic {
   Topic& operator=(const Topic&) = delete;
 
   static bool destroy(const std::string& name) { return shm_unlink(name.c_str()) == 0; }
-  static constexpr size_t max_payload_size() { return kMaxPayload; }
+  // The largest payload a loan can hold, counting the large class.
+  static constexpr size_t max_payload_size() {
+    return kMaxLargePayload > kMaxPayload ? kMaxLargePayload : kMaxPayload;
+  }
   const Options& options() const { return options_; }
 
   // Reclaims slots whose owners exited: their loans, queued references,
@@ -1028,11 +1050,36 @@ class Topic {
   SlotRecord& slot(uint32_t i) { return region_->slots[i]; }
   GroupRecord& group(uint32_t g) { return region_->groups[g]; }
   detail::BlockHeader& header(uint32_t id) {
-    return *reinterpret_cast<detail::BlockHeader*>(blocks_ + static_cast<size_t>(id) * kBlockSize);
+    return *reinterpret_cast<detail::BlockHeader*>(blocks_ + block_offset(id));
   }
-  char* payload(uint32_t id) {
-    return blocks_ + static_cast<size_t>(id) * kBlockSize + sizeof(detail::BlockHeader);
+  static size_t block_offset(uint32_t id) {
+    return id < kBlockCount ? static_cast<size_t>(id) * kBlockSize
+                            : static_cast<size_t>(kBlockCount) * kBlockSize +
+                                  static_cast<size_t>(id - kBlockCount) * kLargeBlockSize;
   }
+  static size_t payload_capacity(uint32_t id) {
+    return id < kBlockCount ? kMaxPayload : kMaxLargePayload;
+  }
+  bool pop_free(size_t size, uint32_t& id) {
+    if (size <= kMaxPayload) return region_->free_list.pop(id);
+    if (!kLargeBlockCount || !region_->large_free_list.pop(id)) return false;
+    id += kBlockCount;
+    return true;
+  }
+  void push_free(uint32_t id, bool force = false) {
+    if (id < kBlockCount) {
+      if (force) {
+        region_->free_list.force_push(id);
+      } else {
+        region_->free_list.push(id);
+      }
+    } else if (force) {
+      region_->large_free_list.force_push(id - kBlockCount);
+    } else {
+      region_->large_free_list.push(id - kBlockCount);
+    }
+  }
+  char* payload(uint32_t id) { return blocks_ + block_offset(id) + sizeof(detail::BlockHeader); }
   static bool is_publisher_slot(uint32_t i) { return i < kMaxPublishers; }
 
   void open_region() {
@@ -1075,9 +1122,10 @@ class Topic {
         region_->max_groups = kMaxGroups;
         region_->queue_capacity = kQueueCapacity;
         region_->free_list.init();
+        if (kLargeBlockCount) region_->large_free_list.init();
         for (uint32_t i = 0; i < kSlots; ++i) region_->slots[i].init();
         for (uint32_t g = 0; g <= kMaxGroups; ++g) region_->groups[g].init();
-        for (uint32_t id = 0; id < kBlockCount; ++id) {
+        for (uint32_t id = 0; id < kBlockIds; ++id) {
           new (&header(id)) detail::BlockHeader();
           header(id).state.store(0, std::memory_order_relaxed);
         }
@@ -1292,7 +1340,7 @@ class Topic {
     const uint64_t previous = header(id).state.fetch_sub(bits, std::memory_order_acq_rel);
     if (previous == bits) {
       SHM_PUBSUB_FAULT_POINT("release.before_push");
-      region_->free_list.push(id);
+      push_free(id);
     }
   }
 
@@ -1305,7 +1353,7 @@ class Topic {
       if (header(id).state.compare_exchange_weak(state, state - bit, std::memory_order_acq_rel)) {
         if (state == bit) {
           SHM_PUBSUB_FAULT_POINT("release.before_push");
-          region_->free_list.push(id);
+          push_free(id);
         }
         return true;
       }
@@ -1392,7 +1440,7 @@ class Topic {
       q.release(pos);
       SHM_PUBSUB_FAULT_POINT("group.drain_after_release");
       id = detail::cell_block(id);
-      if (id < kBlockCount) release_bits(id, detail::kQueueUnit);
+      if (id < kBlockIds) release_bits(id, detail::kQueueUnit);
     }
   }
 
@@ -1471,7 +1519,7 @@ class Topic {
     bool may_leak = resumed;
     if (last_op == detail::kOpRelease) {
       const uint32_t id = detail::activity_block(last);
-      may_leak |= id >= kBlockCount || header(id).state.load(std::memory_order_acquire) == 0;
+      may_leak |= id >= kBlockIds || header(id).state.load(std::memory_order_acquire) == 0;
     } else if (last_op != detail::kOpIdle && last_op != detail::kOpTake) {
       may_leak = true;
     }
@@ -1542,7 +1590,7 @@ class Topic {
     }
     for (uint32_t k = 0; k < kLoanEntries; ++k) {
       const uint32_t id = detail::cell_block(s.held[k].load(std::memory_order_relaxed));
-      if (id < kBlockCount) clear_holder(id, i);
+      if (id < kBlockIds) clear_holder(id, i);
       s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
     }
     s.queue.init();
@@ -1564,7 +1612,7 @@ class Topic {
     const uint32_t op = detail::activity_op(last);
     const uint32_t id = detail::activity_block(last);
     if ((op != detail::kOpPublish && op != detail::kOpRequeue) || resumed ||
-        (last & detail::kActivityDropping) || id >= kBlockCount ||
+        (last & detail::kActivityDropping) || id >= kBlockIds ||
         !recount_block(id, wait_ns, 1ULL << i)) {
       return false;
     }
@@ -1583,7 +1631,7 @@ class Topic {
       const uint32_t entry = s.held[k].load(std::memory_order_relaxed);
       if (entry == detail::kNoEntry) continue;
       const uint32_t id = detail::cell_block(entry);
-      if (id >= kBlockCount || !(header(id).state.load(std::memory_order_acquire) & (1ULL << i))) {
+      if (id >= kBlockIds || !(header(id).state.load(std::memory_order_acquire) & (1ULL << i))) {
         s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
         continue;
       }
@@ -1722,12 +1770,11 @@ class Topic {
       if (c.sequence.load(std::memory_order_acquire) != expected) continue;
       const uint32_t cell = c.value.load(std::memory_order_relaxed);
       const uint32_t id = cell == detail::kTombstone ? cell : detail::cell_block(cell);
-      const uint64_t untrusted =
-          id < kBlockCount
-              ? header(id).state.load(std::memory_order_acquire) & detail::kHolderMask & ~trusted
-              : 0;
+      const uint64_t untrusted = id < kBlockIds ? header(id).state.load(std::memory_order_acquire) &
+                                                      detail::kHolderMask & ~trusted
+                                                : 0;
       const bool keep = untrusted != 0;
-      if (!keep && id < kBlockCount && stuck[k].group && at_least_once(stuck[k].group)) {
+      if (!keep && id < kBlockIds && stuck[k].group && at_least_once(stuck[k].group)) {
         // The claimer died before converting: deliver the message again.
         // A crash before the release below redelivers it once more, which
         // at-least-once allows.
@@ -1739,7 +1786,7 @@ class Topic {
         continue;
       }
       if (report) ++report->cells_released;
-      if (id >= kBlockCount) continue;
+      if (id >= kBlockIds) continue;
       if (keep) {
         // Exact when only dead members of this group hold the block and it
         // occurs nowhere else in the queue: such a bit can only come from
@@ -1858,7 +1905,7 @@ class Topic {
         SHM_PUBSUB_FAULT_POINT("recount.before_cas");
         if (header(id).state.compare_exchange_strong(expected, computed,
                                                      std::memory_order_acq_rel)) {
-          if (computed == 0) region_->free_list.push(id);
+          if (computed == 0) push_free(id);
           return true;
         }
       }
@@ -1887,8 +1934,7 @@ class Topic {
       // Claimed but never released: either the owner died before converting
       // the reference into its holder bit, or a dropping publisher died
       // before releasing the cell (it drops the reference afterwards).
-      if (id < kBlockCount &&
-          !(header(id).state.load(std::memory_order_acquire) & (1ULL << owner))) {
+      if (id < kBlockIds && !(header(id).state.load(std::memory_order_acquire) & (1ULL << owner))) {
         release_bits(id, detail::kQueueUnit);
       }
     }
@@ -1903,7 +1949,7 @@ class Topic {
         continue;
       }
       SHM_PUBSUB_FAULT_POINT("reclaim.after_mark");
-      if (id < kBlockCount) release_bits(id, detail::kQueueUnit);
+      if (id < kBlockIds) release_bits(id, detail::kQueueUnit);
     }
   }
 
@@ -1932,7 +1978,7 @@ class Topic {
       if (seq == pos + 1) {
         const uint32_t raw = q.cell(pos).value.load(std::memory_order_relaxed);
         const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
-        if (id < kBlockCount) {
+        if (id < kBlockIds) {
           ++refs[id];
         } else if (id != detail::kTombstone) {
           ++rep.inconsistencies;
@@ -1951,16 +1997,22 @@ class Topic {
       activity[i] = slot(i).activity.fetch_add(0, std::memory_order_acq_rel);
       if (detail::activity_op(activity[i]) != detail::kOpIdle) return Status::kBusy;
     }
-    std::vector<uint64_t> states(kBlockCount);
-    std::vector<uint32_t> refs(kBlockCount, 0);
-    std::vector<char> in_free(kBlockCount, 0);
+    std::vector<uint64_t> states(kBlockIds);
+    std::vector<uint32_t> refs(kBlockIds, 0);
+    std::vector<char> in_free(kBlockIds, 0);
     std::vector<CellFix> fixes;
     bool list_ok = region_->free_list.for_each_free([&](uint32_t id) {
       if (in_free[id]) ++rep.inconsistencies;
       in_free[id] = 1;
     });
+    if (kLargeBlockCount) {
+      list_ok &= region_->large_free_list.for_each_free([&](uint32_t local) {
+        if (in_free[kBlockCount + local]) ++rep.inconsistencies;
+        in_free[kBlockCount + local] = 1;
+      });
+    }
     if (!list_ok) ++rep.inconsistencies;
-    for (uint32_t id = 0; id < kBlockCount; ++id) {
+    for (uint32_t id = 0; id < kBlockIds; ++id) {
       states[id] = header(id).state.load(std::memory_order_acquire);
     }
     for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
@@ -2005,7 +2057,7 @@ class Topic {
       }
     }
     const uint64_t holders = live & detail::kHolderMask;
-    for (uint32_t id = 0; id < kBlockCount; ++id) {
+    for (uint32_t id = 0; id < kBlockIds; ++id) {
       const uint64_t observed = states[id];
       const uint64_t computed =
           (observed & holders) | (static_cast<uint64_t>(refs[id]) << detail::kMaxHolderBits);
@@ -2020,7 +2072,7 @@ class Topic {
         continue;
       }
       if (computed == 0) {
-        region_->free_list.force_push(id);
+        push_free(id, true);
         ++rep.orphans_freed;
       } else {
         ++rep.states_repaired;
@@ -2039,6 +2091,14 @@ class Topic {
     uint32_t free_blocks = 0;
     snap.free_list_consistent = region.free_list.for_each_free([&](uint32_t) { ++free_blocks; });
     snap.free_blocks = free_blocks;
+    snap.large_block_count = kLargeBlockCount;
+    snap.large_block_size = kLargeBlockSize;
+    if (kLargeBlockCount) {
+      uint32_t large_free = 0;
+      snap.free_list_consistent &=
+          region.large_free_list.for_each_free([&](uint32_t) { ++large_free; });
+      snap.large_free_blocks = large_free;
+    }
     (void)blocks;
     for (uint32_t i = 0; i < kSlots; ++i) {
       const auto& s = region.slots[i];
@@ -2116,6 +2176,14 @@ template <class C>
 constexpr uint32_t Topic<C>::kSlots;
 template <class C>
 constexpr size_t Topic<C>::kMaxPayload;
+template <class C>
+constexpr uint32_t Topic<C>::kLargeBlockCount;
+template <class C>
+constexpr uint32_t Topic<C>::kLargeBlockSize;
+template <class C>
+constexpr uint32_t Topic<C>::kBlockIds;
+template <class C>
+constexpr size_t Topic<C>::kMaxLargePayload;
 template <class C>
 constexpr uint64_t Topic<C>::kRequiredBlocks;
 
