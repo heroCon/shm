@@ -68,7 +68,12 @@ struct RecoveryReport {
   uint32_t cells_released = 0;
   uint32_t pins_cleared = 0;
   uint32_t members_cleared = 0;
+  uint32_t blocks_recounted = 0;
   uint32_t inconsistencies = 0;
+  // collect_garbage() only: local repair could not rule out a leaked block,
+  // so it also ran recover(); `full_repair_status` is that call's result.
+  bool full_repair = false;
+  Status full_repair_status = Status::kOk;
 };
 
 template <class Config = DefaultConfig>
@@ -205,7 +210,7 @@ class Topic {
       counter_ = topic.activate(slot_);
     }
     ~Publisher() {
-      topic_->reclaim_slot(slot_, nullptr);
+      topic_->reclaim_slot(slot_, nullptr, 0, true, nullptr);
       close(fd_);
     }
     Publisher(const Publisher&) = delete;
@@ -419,6 +424,7 @@ class Topic {
           return true;
         }
         if (overflow != Overflow::kDropOldest || attempt == 2) break;
+        if (attempt == 0) topic_->mark_dropping(slot_);
         uint64_t pos;
         uint32_t old;
         if (queue.try_claim(pos, old)) {
@@ -486,7 +492,7 @@ class Topic {
     ~Subscriber() {
       stop();
       unsubscribe();
-      topic_->reclaim_slot(slot_, nullptr);
+      topic_->reclaim_slot(slot_, nullptr, 0, true, nullptr);
       close(fd_);
     }
     Subscriber(const Subscriber&) = delete;
@@ -756,23 +762,15 @@ class Topic {
   const Options& options() const { return options_; }
 
   // Reclaims slots whose owners exited: their loans, queued references,
-  // group memberships and publisher pins. Returns the number reclaimed. When
-  // it reclaims any, it also attempts recover() once, because a dead owner
-  // may have been mid-operation.
-  size_t collect_garbage() {
+  // group memberships and publisher pins, and resolves queue cells a dead
+  // endpoint left half written or half consumed, so live readers are never
+  // stuck behind them. This needs only the live writers to finish their
+  // current operation, not a quiescent topic. Returns the number of slots
+  // reclaimed. If a dead owner may have leaked a block that local repair
+  // cannot attribute, it also attempts recover() once.
+  size_t collect_garbage(RecoveryReport* report = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t reclaimed = 0;
-    for (uint32_t i = 0; i < kSlots; ++i) {
-      if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) ==
-          detail::kSlotFree) {
-        continue;
-      }
-      if (detail::ofd_lock(fd_, i, F_WRLCK) != 0) continue;
-      if (reclaim_slot(i, nullptr)) ++reclaimed;
-      detail::ofd_lock(fd_, i, F_UNLCK);
-    }
-    if (reclaimed) recover_locked(nullptr);
-    return reclaimed;
+    return collect_locked(kReclaimWaitNs, report);
   }
 
   // Full consistency check and repair. Reclaims dead slots, then rebuilds
@@ -928,6 +926,35 @@ class Topic {
     }
   }
 
+  static constexpr uint64_t kReclaimWaitNs = 100000000;
+
+  size_t collect_locked(uint64_t wait_ns, RecoveryReport* report) {
+    RecoveryReport rep;
+    size_t reclaimed = 0;
+    bool leak = false;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) ==
+          detail::kSlotFree) {
+        continue;
+      }
+      if (detail::ofd_lock(fd_, i, F_WRLCK) != 0) continue;
+      if (reclaim_slot(i, &rep, wait_ns, false, &leak)) ++reclaimed;
+      detail::ofd_lock(fd_, i, F_UNLCK);
+    }
+    rep.slots_reclaimed = static_cast<uint32_t>(reclaimed);
+    if (reclaimed && leak) {
+      RecoveryReport full;
+      rep.full_repair = true;
+      rep.full_repair_status = recover_locked(&full);
+      rep.orphans_freed = full.orphans_freed;
+      rep.states_repaired = full.states_repaired;
+      rep.members_cleared = full.members_cleared;
+      rep.inconsistencies = full.inconsistencies;
+    }
+    if (report) *report = rep;
+    return reclaimed;
+  }
+
   Status recover_locked(RecoveryReport* report) {
     RecoveryReport rep;
     if (detail::ofd_lock(fd_, detail::kMaintenanceByte, F_WRLCK) != 0) return Status::kBusy;
@@ -939,7 +966,7 @@ class Topic {
         live |= 1ULL << i;
       } else if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
                      detail::kSlotFree &&
-                 reclaim_slot(i, &rep)) {
+                 reclaim_slot(i, &rep, kReclaimWaitNs, false, nullptr)) {
         ++rep.slots_reclaimed;
       }
     }
@@ -1005,7 +1032,7 @@ class Topic {
       }
       if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
               detail::kSlotFree &&
-          !reclaim_slot(i, nullptr)) {
+          !reclaim_slot(i, nullptr, kReclaimWaitNs, false, nullptr)) {
         detail::ofd_lock(fd, i, F_UNLCK);
         contended = true;
         continue;
@@ -1030,9 +1057,15 @@ class Topic {
   void begin_activity(uint32_t i, uint64_t& counter, uint32_t op, uint32_t id) {
     ++counter;
     slot(i).activity.store((counter << 32) | (static_cast<uint64_t>(op) << 24) | (id & 0xffffff),
-                           std::memory_order_relaxed);
+                           std::memory_order_release);
     // Recovery that observes any later store of this operation also observes
     // the activity word above.
+    std::atomic_thread_fence(std::memory_order_release);
+  }
+  void mark_dropping(uint32_t i) {
+    auto& a = slot(i).activity;
+    a.store(a.load(std::memory_order_relaxed) | detail::kActivityDropping,
+            std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_release);
   }
   void end_activity(uint32_t i, uint64_t& counter) {
@@ -1148,24 +1181,69 @@ class Topic {
 
   // The caller holds slot i's lock byte, so no owner can use the slot. The
   // steps are idempotent: a reclaimer that dies is resumed by the next one.
-  bool reclaim_slot(uint32_t i, RecoveryReport* report) {
+  // `graceful` is set when the owner itself tears down an idle endpoint.
+  // Returns false, leaving the slot RECLAIMING for a later call, when live
+  // endpoints did not finish their current operation within `wait_ns`.
+  // `leak` is set when the dead owner may have left a block that only
+  // recover() can find.
+  bool reclaim_slot(uint32_t i, RecoveryReport* report, uint64_t wait_ns, bool graceful,
+                    bool* leak) {
     auto& s = slot(i);
     uint64_t lc = s.lifecycle.load(std::memory_order_acquire);
-    for (;;) {
-      if (detail::lifecycle_state(lc) == detail::kSlotFree) return false;
-      if (detail::lifecycle_state(lc) == detail::kSlotReclaiming) break;
-      const uint64_t next = (lc & ~detail::kStateMask) | detail::kSlotReclaiming;
-      if (s.lifecycle.compare_exchange_weak(lc, next, std::memory_order_acq_rel)) break;
+    if (detail::lifecycle_state(lc) == detail::kSlotFree) return false;
+    // A reclaimer that died may have been between any two steps.
+    const bool resumed = detail::lifecycle_state(lc) == detail::kSlotReclaiming;
+    if (!resumed) {
+      s.last_activity.store(graceful ? 0 : s.activity.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+      lc = (lc & ~detail::kStateMask) | detail::kSlotReclaiming;
+      s.lifecycle.store(lc, std::memory_order_release);
     }
+    const uint64_t last = s.last_activity.load(std::memory_order_relaxed);
+    const uint32_t last_op = detail::activity_op(last);
     uint64_t counter = s.activity.load(std::memory_order_relaxed) >> 32;
     begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
     s.subscribed.store(0, std::memory_order_release);
+    // Takes leave nothing behind that queue resolution and the loan table do
+    // not cover. A release can die between dropping the last reference and
+    // pushing the block; a still-referenced block shows it got no further.
+    bool may_leak = resumed;
+    if (last_op == detail::kOpRelease) {
+      const uint32_t id = detail::activity_block(last);
+      may_leak |= id >= kBlockCount || header(id).state.load(std::memory_order_acquire) == 0;
+    } else if (last_op != detail::kOpIdle && last_op != detail::kOpTake) {
+      may_leak = true;
+    }
     if (is_publisher_slot(i)) {
       if (s.pinned.exchange(0, std::memory_order_acq_rel) && report) ++report->pins_cleared;
+      if (!graceful) {
+        Queue* queues[kMaxSubscribers + kMaxGroups];
+        size_t n = 0;
+        for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
+          if (detail::lifecycle_state(slot(j).lifecycle.load(std::memory_order_acquire)) ==
+              detail::kSlotActive) {
+            queues[n++] = &slot(j).queue;
+          }
+        }
+        for (uint32_t g = 1; g <= kMaxGroups; ++g) queues[n++] = &group(g).queue;
+        if (!resolve_queues(queues, n, wait_ns, report, may_leak)) {
+          end_activity(i, counter);
+          return false;
+        }
+        SHM_PUBSUB_FAULT_POINT("reclaim.after_resolve");
+        const uint32_t in_flight = detail::activity_block(last);
+        if (last_op == detail::kOpPublish && !resumed && !(last & detail::kActivityDropping) &&
+            in_flight < kBlockCount && recount_block(in_flight, wait_ns)) {
+          may_leak = false;
+          if (report) ++report->blocks_recounted;
+        }
+      }
     } else {
+      // Pairs with the fence in publish: either the publisher sees the slot
+      // leave ACTIVE, or this loop sees its pin and waits.
       std::atomic_thread_fence(std::memory_order_seq_cst);
       const uint64_t bit = member_bit(i);
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+      const uint64_t deadline = detail::monotonic_ns() + wait_ns;
       for (;;) {
         uint64_t waiting = 0;
         for (uint32_t p = 0; p < kMaxPublishers; ++p) {
@@ -1173,16 +1251,30 @@ class Topic {
         }
         // A dead publisher never touches the queue again; its mask is stale.
         if (!(waiting & live_publishers())) break;
-        if (std::chrono::steady_clock::now() > deadline) {
+        if (detail::monotonic_ns() > deadline) {
           end_activity(i, counter);
           return false;
         }
         std::this_thread::yield();
       }
       SHM_PUBSUB_FAULT_POINT("reclaim.after_pin_wait");
-      drain_dead_queue(s.queue, i);
       const uint32_t g = s.group.load(std::memory_order_relaxed);
-      if (g >= 1 && g <= kMaxGroups) leave_group(g, i);
+      const bool member = g >= 1 && g <= kMaxGroups;
+      if (member && !graceful) {
+        // Cells this member claimed must be resolved while its holder bits
+        // still show whether it converted them.
+        Queue* queues[1] = {&group(g).queue};
+        if (!resolve_queues(queues, 1, wait_ns, report, may_leak)) {
+          end_activity(i, counter);
+          return false;
+        }
+      }
+      drain_dead_queue(s.queue, i);
+      if (member) {
+        begin_activity(i, counter, detail::kOpLeave, detail::kNoBlock);
+        leave_group(g, i);
+        begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
+      }
     }
     for (uint32_t k = 0; k < kLoanEntries; ++k) {
       const uint32_t id = s.held[k].load(std::memory_order_relaxed);
@@ -1194,7 +1286,239 @@ class Topic {
     end_activity(i, counter);
     s.lifecycle.store(detail::make_lifecycle(detail::lifecycle_generation(lc), detail::kSlotFree),
                       std::memory_order_release);
+    if (may_leak && leak) *leak = true;
     return true;
+  }
+
+  // Slots whose lock byte another description holds: live owners, and
+  // reclaimers working on a slot.
+  uint64_t held_elsewhere() const {
+    uint64_t live = 0;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (detail::ofd_held_elsewhere(fd_, i)) live |= 1ULL << i;
+    }
+    return live;
+  }
+
+  // Waits until every live slot that was inside an operation has moved on,
+  // so anything such a writer had half done before the call is complete.
+  // Reclaimers in their passive phase (kOpReclaim) touch no shared queue.
+  bool wait_for_writers(uint64_t wait_ns) {
+    uint64_t seen[kSlots] = {};
+    uint64_t pending = 0;
+    const uint64_t live = held_elsewhere();
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (!(live & (1ULL << i))) continue;
+      const uint64_t a = slot(i).activity.load(std::memory_order_acquire);
+      const uint32_t op = detail::activity_op(a);
+      if (op != detail::kOpIdle && op != detail::kOpReclaim) {
+        seen[i] = a;
+        pending |= 1ULL << i;
+      }
+    }
+    const uint64_t deadline = detail::monotonic_ns() + wait_ns;
+    while (pending) {
+      for (uint64_t p = pending; p; p &= p - 1) {
+        const uint32_t i = static_cast<uint32_t>(__builtin_ctzll(p));
+        if (slot(i).activity.load(std::memory_order_acquire) != seen[i]) pending &= ~(1ULL << i);
+      }
+      if (!pending) break;
+      if (detail::monotonic_ns() > deadline) return false;
+      std::this_thread::yield();
+    }
+    return true;
+  }
+
+  struct StuckCell {
+    Queue* queue;
+    uint64_t pos;
+    uint32_t group;  // 0 for a private queue
+    bool hole;
+  };
+
+  // Holes are reserved, uncommitted cells; claimed cells were dequeued but
+  // not released. Either kind stops the queue once it reaches it.
+  void find_stuck(Queue& q, std::vector<StuckCell>& out) {
+    uint32_t g = 0;
+    for (uint32_t k = 1; k <= kMaxGroups; ++k) {
+      if (&q == &group(k).queue) g = k;
+    }
+    const uint64_t d = q.dequeue_pos.load(std::memory_order_acquire);
+    const uint64_t e = q.enqueue_pos.load(std::memory_order_acquire);
+    if (e < d || e - d > kQueueCapacity) return;
+    for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < d; ++pos) {
+      if (q.cell(pos).sequence.load(std::memory_order_acquire) == pos + 1) {
+        StuckCell c = {&q, pos, g, false};
+        out.push_back(c);
+      }
+    }
+    for (uint64_t pos = d; pos < e; ++pos) {
+      if (q.cell(pos).sequence.load(std::memory_order_acquire) == pos) {
+        StuckCell c = {&q, pos, g, true};
+        out.push_back(c);
+      }
+    }
+  }
+
+  // Observes stuck cells first and live writers second. Whoever reserved or
+  // claimed an observed cell did so inside an operation that the second
+  // observation sees (enqueue_pos and dequeue_pos are advanced after the
+  // operation is journaled). Once every such operation has ended, a cell
+  // that is still stuck belongs to a dead endpoint. Holes become
+  // tombstones. A claimed cell is released, and its queue reference is
+  // dropped unless an untrusted holder bit on the block leaves open whether
+  // the claimer already converted it; that case leaks rather than risking a
+  // double release.
+  bool resolve_queues(Queue* const* queues, size_t n, uint64_t wait_ns, RecoveryReport* report,
+                      bool& leak) {
+    std::vector<StuckCell> stuck;
+    for (size_t k = 0; k < n; ++k) find_stuck(*queues[k], stuck);
+    if (stuck.empty()) return true;
+    if (!wait_for_writers(wait_ns)) return false;
+    const uint64_t live = held_elsewhere();
+    uint64_t trusted = 0;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if ((live & (1ULL << i)) && detail::lifecycle_state(slot(i).lifecycle.load(
+                                      std::memory_order_acquire)) == detail::kSlotActive) {
+        trusted |= 1ULL << i;
+      }
+    }
+    for (size_t k = 0; k < stuck.size(); ++k) {
+      auto& c = stuck[k].queue->cell(stuck[k].pos);
+      const uint64_t pos = stuck[k].pos;
+      if (stuck[k].hole) {
+        if (c.sequence.load(std::memory_order_acquire) != pos) continue;
+        SHM_PUBSUB_FAULT_POINT("repair.before_tombstone");
+        c.value.store(detail::kTombstone, std::memory_order_relaxed);
+        uint64_t expected = pos;
+        if (c.sequence.compare_exchange_strong(expected, pos + 1, std::memory_order_acq_rel)) {
+          // The reference the dead publisher added for this cell is
+          // dropped by the recount in that publisher's own reclamation.
+          if (report) ++report->holes_filled;
+        }
+        continue;
+      }
+      uint64_t expected = pos + 1;
+      if (c.sequence.load(std::memory_order_acquire) != expected) continue;
+      const uint32_t id = c.value.load(std::memory_order_relaxed);
+      const uint64_t untrusted =
+          id < kBlockCount
+              ? header(id).state.load(std::memory_order_acquire) & detail::kHolderMask & ~trusted
+              : 0;
+      const bool keep = untrusted != 0;
+      SHM_PUBSUB_FAULT_POINT("repair.before_cell_release");
+      if (!c.sequence.compare_exchange_strong(expected, pos + kQueueCapacity,
+                                              std::memory_order_acq_rel)) {
+        continue;
+      }
+      if (report) ++report->cells_released;
+      if (id >= kBlockCount) continue;
+      if (keep) {
+        // Exact when only dead members of this group hold the block and it
+        // occurs nowhere else in the queue: such a bit can only come from
+        // converting this very cell.
+        if ((untrusted & ~dead_members(stuck[k].group, live)) ||
+            occurs_elsewhere(*stuck[k].queue, pos, id)) {
+          leak = true;
+        }
+      } else {
+        release_bits(id, detail::kQueueUnit);
+      }
+    }
+    return true;
+  }
+
+  uint64_t dead_members(uint32_t g, uint64_t live) const {
+    uint64_t mask = 0;
+    if (g == 0) return 0;
+    for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
+      if (!(live & (1ULL << j)) && region_->slots[j].group.load(std::memory_order_relaxed) == g) {
+        mask |= 1ULL << j;
+      }
+    }
+    return mask;
+  }
+
+  static bool occurs_elsewhere(Queue& q, uint64_t skip, uint32_t id) {
+    const uint64_t d = q.dequeue_pos.load(std::memory_order_acquire);
+    const uint64_t e = q.enqueue_pos.load(std::memory_order_acquire);
+    for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < e; ++pos) {
+      if (pos == skip) continue;
+      const auto& c = q.cell(pos);
+      const uint64_t seq = c.sequence.load(std::memory_order_acquire);
+      if ((seq == pos + 1 || seq == pos) && c.value.load(std::memory_order_relaxed) == id) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Counts committed cells holding block id. Fails while the block may be
+  // in transit: claimed but not released, being drained, or behind a hole
+  // whose value is not written yet.
+  bool count_refs(Queue& q, uint32_t id, uint32_t& refs) {
+    const uint64_t d = q.dequeue_pos.load(std::memory_order_acquire);
+    const uint64_t e = q.enqueue_pos.load(std::memory_order_acquire);
+    if (e < d || e - d > kQueueCapacity) return false;
+    for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < d; ++pos) {
+      const auto& c = q.cell(pos);
+      if (c.sequence.load(std::memory_order_acquire) == pos + 1 &&
+          c.value.load(std::memory_order_relaxed) == id) {
+        return false;
+      }
+    }
+    for (uint64_t pos = d; pos < e; ++pos) {
+      const auto& c = q.cell(pos);
+      const uint64_t seq = c.sequence.load(std::memory_order_acquire);
+      if (seq == pos) return false;
+      if (c.value.load(std::memory_order_relaxed) != id) continue;
+      if (seq == pos + 1) {
+        ++refs;
+      } else if (seq == pos + kQueueCapacity) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Re-derives the queue references of a block whose publisher died while
+  // delivering it, which drops a reference the publisher added but never
+  // placed in a queue. A concurrent conversion changes the state word and
+  // fails the CAS, so the count and the CAS agree. Refuses while a live
+  // endpoint holds the block, since a holder can requeue it.
+  bool recount_block(uint32_t id, uint64_t wait_ns) {
+    const uint64_t deadline = detail::monotonic_ns() + wait_ns;
+    for (;;) {
+      const uint64_t live = held_elsewhere();
+      const uint64_t observed = header(id).state.load(std::memory_order_acquire);
+      // Zero means released, perhaps not yet pushed: only recover() can tell.
+      if (observed == 0) return false;
+      bool settled = (observed & detail::kHolderMask & live) == 0;
+      uint32_t refs = 0;
+      for (uint32_t j = kMaxPublishers; settled && j < kSlots; ++j) {
+        if (detail::lifecycle_state(slot(j).lifecycle.load(std::memory_order_acquire)) !=
+            detail::kSlotFree) {
+          settled = count_refs(slot(j).queue, id, refs);
+        }
+      }
+      for (uint32_t g = 1; settled && g <= kMaxGroups; ++g) {
+        settled = count_refs(group(g).queue, id, refs);
+      }
+      if (settled) {
+        const uint64_t computed = (observed & detail::kHolderMask) |
+                                  (static_cast<uint64_t>(refs) << detail::kMaxHolderBits);
+        if (computed == observed) return true;
+        uint64_t expected = observed;
+        SHM_PUBSUB_FAULT_POINT("recount.before_cas");
+        if (header(id).state.compare_exchange_strong(expected, computed,
+                                                     std::memory_order_acq_rel)) {
+          if (computed == 0) region_->free_list.push(id);
+          return true;
+        }
+      }
+      if (detail::monotonic_ns() > deadline) return false;
+      std::this_thread::yield();
+    }
   }
 
   // No publisher is pinned on this queue and its consumer is gone, so the

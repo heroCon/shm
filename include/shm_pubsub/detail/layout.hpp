@@ -52,7 +52,11 @@ inline uint64_t queue_refs(uint64_t state) { return state >> kMaxHolderBits; }
 enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim, kOpLeave };
 constexpr uint32_t kNoBlock = 0xffffff;
 constexpr uint32_t kNoEntry = 0xffffffffu;
-inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0xff; }
+// Set on a publish that started dropping the oldest entries of a full
+// queue: a death in that phase can leak a block that is not the one being
+// published.
+constexpr uint64_t kActivityDropping = 1ULL << 31;
+inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0x7f; }
 inline uint32_t activity_block(uint64_t v) { return static_cast<uint32_t>(v) & 0xffffff; }
 
 // Byte offsets of OFD locks: one byte per slot plus a maintenance byte.
@@ -98,6 +102,8 @@ struct alignas(64) Slot {
   alignas(64) std::atomic<uint64_t> activity;
   std::atomic<uint64_t> next_sequence;
   std::atomic<uint64_t> pinned;  // publisher slots: subscriber slots being delivered to
+  // The dead owner's activity word, saved before reclamation overwrites it.
+  std::atomic<uint64_t> last_activity;
   std::atomic<uint32_t> held[kLoanEntries];
   SlotStats stats;
   MpmcQueue<kQueueCapacity> queue;
@@ -107,6 +113,7 @@ struct alignas(64) Slot {
     activity.store(0, std::memory_order_relaxed);
     next_sequence.store(0, std::memory_order_relaxed);
     pinned.store(0, std::memory_order_relaxed);
+    last_activity.store(0, std::memory_order_relaxed);
     for (uint32_t k = 0; k < kLoanEntries; ++k) held[k].store(kNoEntry, std::memory_order_relaxed);
     pid.store(0, std::memory_order_relaxed);
     group.store(0, std::memory_order_relaxed);
