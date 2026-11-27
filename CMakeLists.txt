@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.11)
-project(shm_pubsub VERSION 0.4.0 LANGUAGES CXX)
+project(shm_pubsub VERSION 0.4.0 LANGUAGES C CXX)
 
 if(CMAKE_VERSION VERSION_LESS 3.21)
   if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
@@ -13,6 +13,7 @@ option(SHM_PUBSUB_BUILD_TESTS "Build shm_pubsub tests" ${PROJECT_IS_TOP_LEVEL})
 option(SHM_PUBSUB_BUILD_EXAMPLES "Build shm_pubsub examples" ${PROJECT_IS_TOP_LEVEL})
 option(SHM_PUBSUB_BUILD_TOOLS "Build the shmtop inspector" ${PROJECT_IS_TOP_LEVEL})
 option(SHM_PUBSUB_BUILD_BENCHMARKS "Build reproducible benchmarks" OFF)
+option(SHM_PUBSUB_BUILD_C "Build the C API shared library" ${PROJECT_IS_TOP_LEVEL})
 option(SHM_PUBSUB_INSTALL "Generate the install target" ${PROJECT_IS_TOP_LEVEL})
 
 include(GNUInstallDirs)
@@ -51,7 +52,7 @@ if(SHM_PUBSUB_BUILD_TESTS)
                        fairness_test wakeup_test crash_leak_test crash_matrix_test stress_test
                        wait_set_test header_collision_test membership_test
                        slot_contention_test local_repair_test work_queue_test
-                       chaos_test)
+                       chaos_test typed_test io_uring_test)
   foreach(test ${SHM_PUBSUB_TESTS})
     add_executable(${test} tests/${test}.cpp)
     shm_pubsub_internal_target(${test})
@@ -74,6 +75,26 @@ if(SHM_PUBSUB_BUILD_BENCHMARKS)
   add_executable(uds_benchmark benchmarks/uds_benchmark.cpp)
   set_target_properties(uds_benchmark PROPERTIES CXX_STANDARD 11)
   target_link_libraries(uds_benchmark PRIVATE Threads::Threads)
+endif()
+
+if(SHM_PUBSUB_BUILD_C)
+  add_library(shm_pubsub_c SHARED bindings/c/shm_pubsub.cpp)
+  set_target_properties(shm_pubsub_c PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON
+                                                CXX_EXTENSIONS OFF OUTPUT_NAME shm_pubsub_c)
+  target_compile_options(shm_pubsub_c PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
+  target_link_libraries(shm_pubsub_c PUBLIC shm_pubsub)
+  target_include_directories(shm_pubsub_c PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/bindings/c>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  if(SHM_PUBSUB_BUILD_TESTS)
+    add_executable(c_api_test bindings/c/test_c.c)
+    target_link_libraries(c_api_test PRIVATE shm_pubsub_c)
+    add_test(NAME c_api_test COMMAND c_api_test)
+  endif()
+  if(SHM_PUBSUB_INSTALL)
+    install(TARGETS shm_pubsub_c EXPORT shm_pubsubTargets)
+    install(FILES bindings/c/shm_pubsub.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  endif()
 endif()
 
 if(SHM_PUBSUB_INSTALL)

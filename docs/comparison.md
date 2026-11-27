@@ -21,7 +21,7 @@ point.
 | Payload model | fixed-size blocks, zero copy | zero copy, typed samples, dynamic sizes | zero copy, typed | serialized messages (protobuf etc.) | zero copy of structured data | byte buffers | build your own |
 | Broadcast + competing consumers in one topic | yes (consumer groups) | publish-subscribe only, plus other patterns | no | no | n/a | route (1:N) and channel (N:M) types | build your own |
 | Backpressure policy per reader | `kDropNewest` / `kDropOldest`, pool cannot be exhausted | configurable history and buffer, safe overflow | discard oldest or block publisher | transport-dependent | see project docs | see project docs | build your own |
-| Dead-process cleanup | per-slot reclaim plus `recover()`, verified at 13 fault points | dead-node detection and cleanup | RouDi monitoring | n/a (no shared ownership) | see project docs | see project docs | robust mutexes only |
+| Dead-process cleanup | per-slot reclaim, local repair in `collect_garbage()`, `recover()`; verified at every fault point | dead-node detection and cleanup | RouDi monitoring | n/a (no shared ownership) | see project docs | see project docs | robust mutexes only |
 | Monitoring | `shmtop`, `Topic::inspect` | CLI tooling | introspection | eCAL Monitor, recorder | – | – | – |
 
 ## When to use something else
