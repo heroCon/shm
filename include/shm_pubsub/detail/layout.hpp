@@ -180,6 +180,9 @@ struct Region {
   uint32_t max_subscribers;
   uint32_t max_groups;
   uint32_t queue_capacity;
+  // Set when a reclamation could not rule out a leaked block; the next
+  // collect_garbage() or exhausted loan runs recover() and clears it.
+  std::atomic<uint32_t> repair_pending;
   alignas(64) LockFreeFreeList<uint32_t, Config::kBlockCount> free_list;
   Slot<Config::kQueueCapacity, loan_entries<Config>()>
       slots[Config::kMaxPublishers + Config::kMaxSubscribers];

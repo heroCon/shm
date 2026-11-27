@@ -53,6 +53,11 @@ struct Options {
   mode_t mode = 0660;
   bool unlink_on_destroy = false;
   std::chrono::milliseconds initialization_timeout{5000};
+  // Endpoints that notice a symptom of a dead peer (a full or stalled queue,
+  // an exhausted pool) run collect_garbage() themselves, at most once per
+  // interval per process and only if no other thread is collecting.
+  bool self_heal = true;
+  std::chrono::microseconds self_heal_interval{10000};
 };
 
 struct SubscriberOptions {
@@ -210,7 +215,7 @@ class Topic {
       counter_ = topic.activate(slot_);
     }
     ~Publisher() {
-      topic_->reclaim_slot(slot_, nullptr, 0, true, nullptr);
+      topic_->reclaim_slot(slot_, nullptr, kReclaimWaitNs, true, nullptr);
       close(fd_);
     }
     Publisher(const Publisher&) = delete;
@@ -222,10 +227,14 @@ class Topic {
       if (held_ >= kMaxLoansPerPublisher) return Status::kLoanLimit;
       uint32_t id;
       if (!try_loan(size, id)) {
-        topic_->collect_garbage();
-        if (!try_loan(size, id)) {
-          topic_->recover(nullptr);
-          if (!try_loan(size, id)) return Status::kPoolExhausted;
+        if (topic_->options_.self_heal) {
+          if (!topic_->heal(true) || !try_loan(size, id)) return Status::kPoolExhausted;
+        } else {
+          topic_->collect_garbage();
+          if (!try_loan(size, id)) {
+            topic_->recover(nullptr);
+            if (!try_loan(size, id)) return Status::kPoolExhausted;
+          }
         }
       }
       out.owner_ = this;
@@ -376,6 +385,8 @@ class Topic {
       }
       slot.stats.published.store(slot.stats.published.load(std::memory_order_relaxed) + count,
                                  std::memory_order_relaxed);
+      // A queue that stays full may be stuck behind a dead endpoint's cell.
+      if (r.delivered < r.targets) topic_->heal(false);
       if (r.targets == 0) {
         r.status = Status::kNoSubscribers;
       } else if (r.delivered == 0) {
@@ -492,7 +503,7 @@ class Topic {
     ~Subscriber() {
       stop();
       unsubscribe();
-      topic_->reclaim_slot(slot_, nullptr, 0, true, nullptr);
+      topic_->reclaim_slot(slot_, nullptr, kReclaimWaitNs, true, nullptr);
       close(fd_);
     }
     Subscriber(const Subscriber&) = delete;
@@ -529,7 +540,11 @@ class Topic {
       auto& queue = source();
       // An empty poll writes nothing, so idle busy-polling readers do not
       // keep recover() from observing a quiescent snapshot.
-      if (!queue.head_ready()) return Status::kWouldBlock;
+      if (!queue.head_ready()) {
+        if (topic_->options_.self_heal) watch_stall(queue);
+        return Status::kWouldBlock;
+      }
+      stalled_since_ = 0;
       begin(detail::kOpTake, detail::kNoBlock);
       for (;;) {
         uint64_t pos;
@@ -616,7 +631,10 @@ class Topic {
           w.waiters.fetch_sub(1, std::memory_order_release);
           return status;
         }
-        const timespec relative = detail::to_timespec(deadline - now);
+        uint64_t sleep_ns = deadline - now;
+        // Wake up periodically so take() can notice a stalled queue.
+        if (topic_->options_.self_heal) sleep_ns = std::min(sleep_ns, topic_->heal_interval_ns());
+        const timespec relative = detail::to_timespec(sleep_ns);
         const long rc = detail::futex_wait(&w.generation, generation, &relative);
         const int error = errno;
         w.waiters.fetch_sub(1, std::memory_order_release);
@@ -651,6 +669,21 @@ class Topic {
     using Queue = detail::MpmcQueue<kQueueCapacity>;
 
     Queue& source() { return group_ ? topic_->group(group_).queue : topic_->slot(slot_).queue; }
+
+    // Entries queued behind an unready head for a whole interval suggest a
+    // cell a dead endpoint left behind.
+    void watch_stall(const Queue& queue) {
+      if (queue.size_approx() == 0) {
+        stalled_since_ = 0;
+        return;
+      }
+      const uint64_t now = detail::monotonic_ns();
+      if (stalled_since_ == 0) {
+        stalled_since_ = now;
+      } else if (now - stalled_since_ >= topic_->heal_interval_ns()) {
+        topic_->heal(false);
+      }
+    }
     static bool queue_ready(const void* queue) {
       return static_cast<const Queue*>(queue)->head_ready();
     }
@@ -699,6 +732,7 @@ class Topic {
     uint32_t slot_ = 0;
     uint32_t held_ = 0;
     uint64_t counter_ = 0;
+    uint64_t stalled_since_ = 0;
     bool subscribed_ = false;
     std::atomic<bool> running_{true};
   };
@@ -767,7 +801,8 @@ class Topic {
   // stuck behind them. This needs only the live writers to finish their
   // current operation, not a quiescent topic. Returns the number of slots
   // reclaimed. If a dead owner may have leaked a block that local repair
-  // cannot attribute, it also attempts recover() once.
+  // cannot attribute (now or in an earlier reclamation that could not
+  // repair), it also attempts recover() once.
   size_t collect_garbage(RecoveryReport* report = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     return collect_locked(kReclaimWaitNs, report);
@@ -927,6 +962,32 @@ class Topic {
   }
 
   static constexpr uint64_t kReclaimWaitNs = 100000000;
+  // Data-path healing must not hold up the caller for long.
+  static constexpr uint64_t kHealWaitNs = 1000000;
+
+  uint64_t heal_interval_ns() const {
+    const auto us = options_.self_heal_interval.count();
+    return us > 0 ? static_cast<uint64_t>(us) * 1000 : 1;
+  }
+
+  // Rate-limited, non-blocking collect_garbage(); `full` adds recover() for
+  // leaks no dead slot accounts for. Returns false if it did not run.
+  bool heal(bool full) {
+    if (!options_.self_heal) return false;
+    const uint64_t now = detail::monotonic_ns();
+    uint64_t next = next_heal_ns_.load(std::memory_order_relaxed);
+    if (now < next) return false;
+    if (!next_heal_ns_.compare_exchange_strong(next, now + heal_interval_ns(),
+                                               std::memory_order_relaxed)) {
+      return false;
+    }
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    RecoveryReport report;
+    collect_locked(kHealWaitNs, &report);
+    if (full && !report.full_repair) recover_locked(nullptr, kHealWaitNs);
+    return true;
+  }
 
   size_t collect_locked(uint64_t wait_ns, RecoveryReport* report) {
     RecoveryReport rep;
@@ -942,10 +1003,10 @@ class Topic {
       detail::ofd_lock(fd_, i, F_UNLCK);
     }
     rep.slots_reclaimed = static_cast<uint32_t>(reclaimed);
-    if (reclaimed && leak) {
+    if ((reclaimed && leak) || region_->repair_pending.load(std::memory_order_relaxed)) {
       RecoveryReport full;
       rep.full_repair = true;
-      rep.full_repair_status = recover_locked(&full);
+      rep.full_repair_status = recover_locked(&full, wait_ns);
       rep.orphans_freed = full.orphans_freed;
       rep.states_repaired = full.states_repaired;
       rep.members_cleared = full.members_cleared;
@@ -955,7 +1016,7 @@ class Topic {
     return reclaimed;
   }
 
-  Status recover_locked(RecoveryReport* report) {
+  Status recover_locked(RecoveryReport* report, uint64_t wait_ns = kReclaimWaitNs) {
     RecoveryReport rep;
     if (detail::ofd_lock(fd_, detail::kMaintenanceByte, F_WRLCK) != 0) return Status::kBusy;
     bool locked[kSlots];
@@ -966,11 +1027,12 @@ class Topic {
         live |= 1ULL << i;
       } else if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
                      detail::kSlotFree &&
-                 reclaim_slot(i, &rep, kReclaimWaitNs, false, nullptr)) {
+                 reclaim_slot(i, &rep, wait_ns, false, nullptr)) {
         ++rep.slots_reclaimed;
       }
     }
     const Status status = repair(live, rep);
+    if (status == Status::kOk) region_->repair_pending.store(0, std::memory_order_relaxed);
     for (uint32_t i = 0; i < kSlots; ++i) {
       if (locked[i]) detail::ofd_lock(fd_, i, F_UNLCK);
     }
@@ -1226,14 +1288,14 @@ class Topic {
           }
         }
         for (uint32_t g = 1; g <= kMaxGroups; ++g) queues[n++] = &group(g).queue;
-        if (!resolve_queues(queues, n, wait_ns, report, may_leak)) {
+        if (!resolve_queues(queues, n, wait_ns, 1ULL << i, report, may_leak)) {
           end_activity(i, counter);
           return false;
         }
         SHM_PUBSUB_FAULT_POINT("reclaim.after_resolve");
         const uint32_t in_flight = detail::activity_block(last);
         if (last_op == detail::kOpPublish && !resumed && !(last & detail::kActivityDropping) &&
-            in_flight < kBlockCount && recount_block(in_flight, wait_ns)) {
+            in_flight < kBlockCount && recount_block(in_flight, wait_ns, 1ULL << i)) {
           may_leak = false;
           if (report) ++report->blocks_recounted;
         }
@@ -1264,7 +1326,7 @@ class Topic {
         // Cells this member claimed must be resolved while its holder bits
         // still show whether it converted them.
         Queue* queues[1] = {&group(g).queue};
-        if (!resolve_queues(queues, 1, wait_ns, report, may_leak)) {
+        if (!resolve_queues(queues, 1, wait_ns, 1ULL << i, report, may_leak)) {
           end_activity(i, counter);
           return false;
         }
@@ -1286,27 +1348,31 @@ class Topic {
     end_activity(i, counter);
     s.lifecycle.store(detail::make_lifecycle(detail::lifecycle_generation(lc), detail::kSlotFree),
                       std::memory_order_release);
-    if (may_leak && leak) *leak = true;
+    if (may_leak) {
+      region_->repair_pending.store(1, std::memory_order_relaxed);
+      if (leak) *leak = true;
+    }
     return true;
   }
 
   // Slots whose lock byte another description holds: live owners, and
-  // reclaimers working on a slot.
-  uint64_t held_elsewhere() const {
+  // reclaimers working on a slot. `self` is the slot being reclaimed, which
+  // a constructor reclaims through its own description.
+  uint64_t held_elsewhere(uint64_t self) const {
     uint64_t live = 0;
     for (uint32_t i = 0; i < kSlots; ++i) {
       if (detail::ofd_held_elsewhere(fd_, i)) live |= 1ULL << i;
     }
-    return live;
+    return live & ~self;
   }
 
   // Waits until every live slot that was inside an operation has moved on,
   // so anything such a writer had half done before the call is complete.
   // Reclaimers in their passive phase (kOpReclaim) touch no shared queue.
-  bool wait_for_writers(uint64_t wait_ns) {
+  bool wait_for_writers(uint64_t wait_ns, uint64_t self) {
     uint64_t seen[kSlots] = {};
     uint64_t pending = 0;
-    const uint64_t live = held_elsewhere();
+    const uint64_t live = held_elsewhere(self);
     for (uint32_t i = 0; i < kSlots; ++i) {
       if (!(live & (1ULL << i))) continue;
       const uint64_t a = slot(i).activity.load(std::memory_order_acquire);
@@ -1369,13 +1435,13 @@ class Topic {
   // dropped unless an untrusted holder bit on the block leaves open whether
   // the claimer already converted it; that case leaks rather than risking a
   // double release.
-  bool resolve_queues(Queue* const* queues, size_t n, uint64_t wait_ns, RecoveryReport* report,
-                      bool& leak) {
+  bool resolve_queues(Queue* const* queues, size_t n, uint64_t wait_ns, uint64_t self,
+                      RecoveryReport* report, bool& leak) {
     std::vector<StuckCell> stuck;
     for (size_t k = 0; k < n; ++k) find_stuck(*queues[k], stuck);
     if (stuck.empty()) return true;
-    if (!wait_for_writers(wait_ns)) return false;
-    const uint64_t live = held_elsewhere();
+    if (!wait_for_writers(wait_ns, self)) return false;
+    const uint64_t live = held_elsewhere(self);
     uint64_t trusted = 0;
     for (uint32_t i = 0; i < kSlots; ++i) {
       if ((live & (1ULL << i)) && detail::lifecycle_state(slot(i).lifecycle.load(
@@ -1486,10 +1552,10 @@ class Topic {
   // placed in a queue. A concurrent conversion changes the state word and
   // fails the CAS, so the count and the CAS agree. Refuses while a live
   // endpoint holds the block, since a holder can requeue it.
-  bool recount_block(uint32_t id, uint64_t wait_ns) {
+  bool recount_block(uint32_t id, uint64_t wait_ns, uint64_t self) {
     const uint64_t deadline = detail::monotonic_ns() + wait_ns;
     for (;;) {
-      const uint64_t live = held_elsewhere();
+      const uint64_t live = held_elsewhere(self);
       const uint64_t observed = header(id).state.load(std::memory_order_acquire);
       // Zero means released, perhaps not yet pushed: only recover() can tell.
       if (observed == 0) return false;
@@ -1733,6 +1799,7 @@ class Topic {
   }
 
   Options options_;
+  std::atomic<uint64_t> next_heal_ns_{0};
   int fd_ = -1;
   Region* region_ = nullptr;
   char* blocks_ = nullptr;

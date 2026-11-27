@@ -35,7 +35,7 @@ Shared* make_shared() {
 }
 
 // A reader that never sleeps and never calls recover().
-pid_t spawn_reader(const shm_pubsub::Options& o, Shared* g, uint32_t group) {
+pid_t spawn_reader(const shm_pubsub::Options& o, Shared* g, uint32_t group, bool blocking = false) {
   const pid_t pid = fork();
   if (pid == 0) {
     prctl(PR_SET_PDEATHSIG, SIGKILL);
@@ -46,7 +46,9 @@ pid_t spawn_reader(const shm_pubsub::Options& o, Shared* g, uint32_t group) {
     g->ready.fetch_add(1);
     while (!g->stop.load()) {
       Topic::ReadLoan loan;
-      if (sub.take(loan) == Status::kOk) g->received.fetch_add(1);
+      const Status st =
+          blocking ? sub.wait_take(loan, std::chrono::milliseconds(1000)) : sub.take(loan);
+      if (st == Status::kOk) g->received.fetch_add(1);
     }
     _exit(0);
   }
@@ -114,6 +116,7 @@ void hole_in_private_queue() {
   ScopedName name("local_hole");
   shm_pubsub::Options o;
   o.name = name.name;
+  o.self_heal = false;
   Topic topic(o);
   Shared* g = make_shared();
   pid_t reader = spawn_reader(o, g, 0);
@@ -126,6 +129,7 @@ void hole_in_group_queue() {
   ScopedName name("local_group_hole");
   shm_pubsub::Options o;
   o.name = name.name;
+  o.self_heal = false;
   Topic topic(o);
   Shared* g = make_shared();
   pid_t readers[2] = {spawn_reader(o, g, 1), spawn_reader(o, g, 1)};
@@ -138,6 +142,7 @@ void claimed_by_dead_member() {
   ScopedName name("local_claim");
   shm_pubsub::Options o;
   o.name = name.name;
+  o.self_heal = false;
   Topic topic(o);
   Shared* g = make_shared();
   pid_t reader = spawn_reader(o, g, 1);
@@ -169,6 +174,7 @@ void converted_by_dead_member() {
   ScopedName name("local_convert");
   shm_pubsub::Options o;
   o.name = name.name;
+  o.self_heal = false;
   Topic topic(o);
   Shared* g = make_shared();
   pid_t reader = spawn_reader(o, g, 1);
@@ -199,12 +205,79 @@ void dead_publisher_mid_fanout() {
   ScopedName name("local_fanout");
   shm_pubsub::Options o;
   o.name = name.name;
+  o.self_heal = false;
   Topic topic(o);
   Shared* g = make_shared();
   pid_t readers[2] = {spawn_reader(o, g, 0), spawn_reader(o, g, 0)};
   while (g->ready.load() < 2) std::this_thread::yield();
   CHECK(killed_at("publish.after_ref:7", publish_some, o));
   check_repair("publisher mid fan-out", topic, g, readers, 2, true);
+}
+
+// Nobody calls collect_garbage(): the stalled reader heals the topic.
+void self_heal_stalled_reader(bool blocking) {
+  ScopedName name("self_heal_reader");
+  shm_pubsub::Options o;
+  o.name = name.name;
+  Topic topic(o);
+  Shared* g = make_shared();
+  pid_t reader = spawn_reader(o, g, 0, blocking);
+  while (g->ready.load() < 1) std::this_thread::yield();
+  // The healthy publisher exists first, so no constructor reuses the dead
+  // slot, and does not heal itself: only the reader can unblock the queue.
+  shm_pubsub::Options quiet = o;
+  quiet.self_heal = false;
+  Topic quiet_topic(quiet);
+  long before = 0;
+  int sent = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  {
+    Topic::Publisher pub(quiet_topic);
+    CHECK(killed_at("queue.after_reserve:5", publish_some, o));
+    before = g->received.load();
+    while (sent < 200 && std::chrono::steady_clock::now() < deadline) {
+      if (pub.publish_copy("y", 1).status == Status::kOk) {
+        ++sent;
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  }
+  while (g->received.load() - before < 200 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK(g->received.load() - before >= 200);
+  g->stop.store(1);
+  waitpid(reader, nullptr, 0);
+  CHECK(free_blocks(topic) == Topic::kBlockCount);
+  std::printf("self-heal, %-17s received=%ld\n", blocking ? "wait_take reader" : "busy reader",
+              g->received.load() - before);
+}
+
+// A leaked block is found when a loan exhausts the pool.
+void self_heal_exhausted_pool() {
+  ScopedName name("self_heal_pool");
+  shm_pubsub::Options o;
+  o.name = name.name;
+  Topic topic(o);
+  Topic::Subscriber sub(topic);
+  CHECK(killed_at("loan.after_pop:1", publish_some, o));
+  CHECK(free_blocks(topic) == Topic::kBlockCount - 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  // Loans pile up in the queue (as a slow reader would) until the pool runs
+  // dry; the loan that finds it empty heals and gets the leaked block.
+  Topic::Publisher pub(topic);
+  uint32_t sent = 0;
+  for (uint32_t i = 0; i < Topic::kBlockCount + 4; ++i) {
+    Topic::WriteLoan loan;
+    if (pub.loan(8, loan) != Status::kOk) break;
+    pub.publish(std::move(loan));
+    ++sent;
+  }
+  Topic::ReadLoan r;
+  while (sub.take(r) == Status::kOk) r.reset();
+  CHECK(free_blocks(topic) == Topic::kBlockCount);
+  std::printf("self-heal, exhausted pool  published=%u\n", sent);
 }
 
 }  // namespace
@@ -215,5 +288,8 @@ int main() {
   claimed_by_dead_member();
   converted_by_dead_member();
   dead_publisher_mid_fanout();
+  self_heal_stalled_reader(false);
+  self_heal_stalled_reader(true);
+  self_heal_exhausted_pool();
   return finish("local_repair_test");
 }
