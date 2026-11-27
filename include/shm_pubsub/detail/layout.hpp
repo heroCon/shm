@@ -17,40 +17,41 @@ static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_LLONG_LOCK_FREE == 2,
               "shm_pubsub requires always-lock-free 32- and 64-bit atomics");
 
 constexpr uint64_t kMagic = 0x53484d5055425355ULL;
-constexpr uint32_t kLayoutVersion = 5;
+constexpr uint32_t kLayoutVersion = 6;
 constexpr uint32_t kReady = 2;
 
-// Slot lifecycle word: state (bits 0-1), publisher pins (bits 8-31, one per
-// publisher slot) and generation (bits 32-63). Publishers pin an ACTIVE
-// subscriber slot before touching its queue; reclamation waits for live pins.
+// Slot lifecycle word: state (bits 0-1) and generation (bits 32-63). Before
+// touching subscriber queues a publisher announces them in its own `pinned`
+// mask (one bit per subscriber slot) and then rechecks that each is ACTIVE;
+// reclamation marks a slot RECLAIMING and then waits for live publishers'
+// masks to drop its bit. Both sides fence in between (Dekker), so publishers
+// never write to a word that other publishers write.
 constexpr uint64_t kStateMask = 3;
 constexpr uint64_t kSlotFree = 0;
 constexpr uint64_t kSlotActive = 1;
 constexpr uint64_t kSlotReclaiming = 2;
-constexpr unsigned kPinShift = 8;
-constexpr unsigned kMaxPinBits = 24;
 
 inline uint64_t lifecycle_state(uint64_t v) { return v & kStateMask; }
 inline uint32_t lifecycle_generation(uint64_t v) { return static_cast<uint32_t>(v >> 32); }
-inline uint64_t lifecycle_pins(uint64_t v) {
-  return (v >> kPinShift) & ((1ULL << kMaxPinBits) - 1);
-}
 inline uint64_t make_lifecycle(uint32_t generation, uint64_t state) {
   return (static_cast<uint64_t>(generation) << 32) | state;
 }
 
-// Block state word: one holder bit per endpoint slot (bits 0-47) plus the
-// number of queue cells that reference the block (bits 48-63). The block
-// returns to the free list when the word drops to zero.
-constexpr unsigned kMaxHolderBits = 48;
+// Block state word: one holder bit per endpoint slot (bits 0-55) plus the
+// number of queue cells that reference the block (bits 56-63). A block sits
+// in a given queue at most once, so 8 bits cover every subscriber and group.
+// The block returns to the free list when the word drops to zero.
+constexpr unsigned kMaxHolderBits = 56;
+constexpr uint32_t kMaxQueueRefs = 255;
 constexpr uint64_t kHolderMask = (1ULL << kMaxHolderBits) - 1;
 constexpr uint64_t kQueueUnit = 1ULL << kMaxHolderBits;
 inline uint64_t queue_refs(uint64_t state) { return state >> kMaxHolderBits; }
 
 // Slot activity word, used both as a journal for diagnostics and as a seqlock
 // for recovery: counter (bits 32-63), operation (bits 24-31), block (0-23).
-enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim };
+enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim, kOpLeave };
 constexpr uint32_t kNoBlock = 0xffffff;
+constexpr uint32_t kNoEntry = 0xffffffffu;
 inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0xff; }
 inline uint32_t activity_block(uint64_t v) { return static_cast<uint32_t>(v) & 0xffffff; }
 
@@ -81,16 +82,23 @@ struct alignas(64) SlotStats {
   }
 };
 
-template <uint32_t kQueueCapacity>
+// The first cache line is read by every publisher on every publish and
+// written only on activation and reclamation. The second holds words the
+// owner writes on every operation.
+// Each slot lists the blocks it may hold a bit on. An id is recorded before
+// the holder bit is set and forgotten after it is cleared, so the table is a
+// superset of the slot's bits and reclamation never scans the whole pool.
+template <uint32_t kQueueCapacity, uint32_t kLoanEntries>
 struct alignas(64) Slot {
   std::atomic<uint64_t> lifecycle;
-  std::atomic<uint64_t> activity;
-  std::atomic<uint64_t> next_sequence;
   std::atomic<uint32_t> pid;
   std::atomic<uint32_t> group;
   std::atomic<uint32_t> overflow;
   std::atomic<uint32_t> subscribed;
-  std::atomic<uint32_t> member;
+  alignas(64) std::atomic<uint64_t> activity;
+  std::atomic<uint64_t> next_sequence;
+  std::atomic<uint64_t> pinned;  // publisher slots: subscriber slots being delivered to
+  std::atomic<uint32_t> held[kLoanEntries];
   SlotStats stats;
   MpmcQueue<kQueueCapacity> queue;
 
@@ -98,32 +106,56 @@ struct alignas(64) Slot {
     lifecycle.store(make_lifecycle(0, kSlotFree), std::memory_order_relaxed);
     activity.store(0, std::memory_order_relaxed);
     next_sequence.store(0, std::memory_order_relaxed);
+    pinned.store(0, std::memory_order_relaxed);
+    for (uint32_t k = 0; k < kLoanEntries; ++k) held[k].store(kNoEntry, std::memory_order_relaxed);
     pid.store(0, std::memory_order_relaxed);
     group.store(0, std::memory_order_relaxed);
     overflow.store(0, std::memory_order_relaxed);
     subscribed.store(0, std::memory_order_relaxed);
-    member.store(0, std::memory_order_relaxed);
     stats.init();
     queue.init();
   }
 };
 
+// Group policy word, fixed by the first member for the lifetime of the
+// region: set flag (bit 31), overflow (bits 0-3), durable (bit 4), delivery
+// (bits 5-6), max deliveries (bits 8-15, 0 = unlimited).
+constexpr uint32_t kPolicySet = 1u << 31;
+inline uint32_t policy_overflow(uint32_t p) { return p & 0xf; }
+inline bool policy_durable(uint32_t p) { return (p >> 4) & 1; }
+inline uint32_t policy_delivery(uint32_t p) { return (p >> 5) & 3; }
+inline uint32_t policy_max_deliveries(uint32_t p) { return (p >> 8) & 0xff; }
+inline uint32_t make_policy(uint32_t overflow, bool durable, uint32_t delivery,
+                            uint32_t max_deliveries) {
+  return kPolicySet | (overflow & 0xf) | (durable ? 1u << 4 : 0) | ((delivery & 3) << 5) |
+         ((max_deliveries & 0xff) << 8);
+}
+
+// Membership is a bitmap (one bit per subscriber slot) so that joining and
+// leaving are single idempotent steps that a crash cannot leave half done.
 template <uint32_t kQueueCapacity>
 struct alignas(64) GroupRecord {
-  std::atomic<uint32_t> members;
-  std::atomic<uint32_t> overflow;
+  std::atomic<uint64_t> member_mask;
+  std::atomic<uint32_t> policy;
   std::atomic<uint64_t> dropped_newest;
   std::atomic<uint64_t> dropped_oldest;
   MpmcQueue<kQueueCapacity> queue;
 
   void init() {
-    members.store(0, std::memory_order_relaxed);
-    overflow.store(0, std::memory_order_relaxed);
+    member_mask.store(0, std::memory_order_relaxed);
+    policy.store(0, std::memory_order_relaxed);
     dropped_newest.store(0, std::memory_order_relaxed);
     dropped_oldest.store(0, std::memory_order_relaxed);
     queue.init();
   }
 };
+
+template <class Config>
+constexpr uint32_t loan_entries() {
+  return Config::kMaxLoansPerPublisher > Config::kMaxLoansPerSubscriber
+             ? Config::kMaxLoansPerPublisher
+             : Config::kMaxLoansPerSubscriber;
+}
 
 // Region header followed by the slot table and group queues. Data blocks
 // follow at blocks_offset(). Group index 0 is unused so that group ids map
@@ -142,7 +174,8 @@ struct Region {
   uint32_t max_groups;
   uint32_t queue_capacity;
   alignas(64) LockFreeFreeList<uint32_t, Config::kBlockCount> free_list;
-  Slot<Config::kQueueCapacity> slots[Config::kMaxPublishers + Config::kMaxSubscribers];
+  Slot<Config::kQueueCapacity, loan_entries<Config>()>
+      slots[Config::kMaxPublishers + Config::kMaxSubscribers];
   GroupRecord<Config::kQueueCapacity> groups[Config::kMaxGroups + 1];
 };
 
@@ -166,8 +199,9 @@ uint64_t config_hash() {
   h = fnv_mix(h, Config::kMaxGroups);
   h = fnv_mix(h, Config::kMaxLoansPerPublisher);
   h = fnv_mix(h, Config::kMaxLoansPerSubscriber);
+  h = fnv_mix(h, Config::kTimestamps ? 1 : 0);
   h = fnv_mix(h, sizeof(Region<Config>));
-  h = fnv_mix(h, sizeof(Slot<Config::kQueueCapacity>));
+  h = fnv_mix(h, sizeof(Slot<Config::kQueueCapacity, loan_entries<Config>()>));
   h = fnv_mix(h, alignof(Region<Config>));
   h = fnv_mix(h, sizeof(void*));
   return h;

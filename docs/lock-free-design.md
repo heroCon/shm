@@ -17,10 +17,15 @@
 
 ## Publish path
 
-One pass over the subscriber slots: for each `ACTIVE`, subscribed, private slot the
-publisher pins the slot in its lifecycle word (a CAS that fails once reclamation has
-started), adds a queue reference, enqueues, and unpins. Then one enqueue per non-empty
-group. Under `kDropOldest` a full queue is made room for by claiming and releasing its
+The publisher collects the `ACTIVE`, subscribed, private subscriber slots into a mask,
+stores it in its own `pinned` word, issues a `seq_cst` fence and rechecks that each
+target is still `ACTIVE`. Reclamation does the mirror image: it marks the slot
+`RECLAIMING`, fences, and waits until no live publisher's mask names the slot. One of
+the two always sees the other (Dekker), and no publisher writes a word that another
+publisher or a reader writes, so publishers do not contend on subscriber cache lines.
+For each target it adds a queue reference and enqueues; then one enqueue per group with
+members. `publish(writes, n)` reuses the mask and fence for all `n` messages and wakes
+each queue once. Under `kDropOldest` a full queue is made room for by claiming and releasing its
 oldest cell (at most two attempts). A successful publish involves no system call unless
 a reader is waiting.
 

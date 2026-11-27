@@ -52,7 +52,8 @@ int main(int argc, char** argv) {
       while (run.load(std::memory_order_relaxed)) {
         SubscriberOptions o;
         o.group = s >= 3 ? 1 : 0;
-        o.overflow = s % 2 ? Overflow::kDropOldest : Overflow::kDropNewest;
+        // Members of one group must agree on its policy.
+        o.overflow = s == 1 || s >= 3 ? Overflow::kDropOldest : Overflow::kDropNewest;
         Topic::Subscriber sub(topic, o);
         for (int i = 0; run.load(std::memory_order_relaxed) && (s == 0 || i < 300); ++i) {
           Topic::ReadLoan loan;
@@ -83,6 +84,7 @@ int main(int argc, char** argv) {
   {
     SubscriberOptions o;
     o.group = 1;
+    o.overflow = Overflow::kDropOldest;
     Topic::Subscriber leftover(topic, o);
     Topic::ReadLoan loan;
     while (leftover.take(loan) == Status::kOk) loan.reset();

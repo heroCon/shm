@@ -8,12 +8,14 @@ Each endpoint occupies one slot in the region for its lifetime.
 
 `Config` supplies `kBlockCount`, `kBlockSize` (including a 64-byte block header, so the
 payload limit is `Topic::max_payload_size()`), `kQueueCapacity`, `kMaxPublishers`,
-`kMaxSubscribers`, `kMaxGroups`, `kMaxLoansPerPublisher` and `kMaxLoansPerSubscriber`.
-Derive from `DefaultConfig` and redeclare the members you change. Compile-time checks
+`kMaxSubscribers`, `kMaxGroups`, `kMaxLoansPerPublisher`, `kMaxLoansPerSubscriber` and
+`kTimestamps` (default `true`; `false` skips the per-publish clock read and leaves
+`timestamp_ns()` at 0). Derive from `DefaultConfig` and redeclare the members you change. Compile-time checks
 enforce:
 
 - `kQueueCapacity` is a power of two and smaller than `kBlockCount`;
-- at most 48 endpoints (`kMaxPublishers + kMaxSubscribers`) and 24 publishers;
+- at most 56 endpoints (`kMaxPublishers + kMaxSubscribers`), and at most 255 queues
+  (`kMaxSubscribers + kMaxGroups`);
 - the **pool budget** `kBlockCount >= (kMaxSubscribers + kMaxGroups) * kQueueCapacity +
   kMaxSubscribers * kMaxLoansPerSubscriber + kMaxPublishers * kMaxLoansPerPublisher`.
 
@@ -22,7 +24,7 @@ bounded, the budget means the pool cannot run dry no matter how slowly subscribe
 `kPoolExhausted` therefore indicates leaked blocks, which `loan()` tries to recover
 before it reports the status.
 
-The region header stores a hash of the configuration and the layout version (5). An
+The region header stores a hash of the configuration and the layout version (6). An
 attach with a different `Config` or layout throws `std::runtime_error`.
 
 ## Publishing
@@ -32,6 +34,7 @@ attach with a different `Config` or layout throws `std::runtime_error`.
 | `loan(size, write)` | `kOk` and a block of `size` bytes (1..`max_payload_size()`); `kLoanLimit` when the endpoint already holds `kMaxLoansPerPublisher` loans; `kMessageTooLarge`; `kInvalidArgument` for size 0 or a non-empty `write`; `kPoolExhausted` only after leaks that `collect_garbage()` and `recover()` could not undo. |
 | `write.resize(n)` | Shrinks or grows the payload within `capacity()`. |
 | `publish(std::move(write))` | Consumes the loan whenever it belongs to this publisher, whatever the status. Returns a `PublishResult`. |
+| `publish(writes, n)` | Publishes up to `kMaxLoansPerPublisher` loans in order with one pass over the subscriber table and at most one wake-up per queue. Counts in the result are summed over the messages. Returns `kInvalidArgument` and consumes nothing unless every loan belongs to this publisher. |
 | `publish_copy(data, size)` | `loan` + `memcpy` + `publish`; returns `kNoSubscribers` without allocating when nobody is eligible. |
 
 `PublishResult` has `targets` (subscribed private subscribers plus groups with at least
@@ -57,19 +60,27 @@ missed messages, through a full queue, `kDropOldest`, or a group sibling taking 
 - `group` in `1..kMaxGroups` joins a **consumer group**. Each group has one queue; every
   publish is offered once per group, and exactly one member takes it.
 - `overflow` selects `kDropNewest` (a full queue rejects the new message) or
-  `kDropOldest` (the publisher discards the oldest queued message to make room). For a
-  group the policy of the most recently registered member applies to the whole group.
+  `kDropOldest` (the publisher discards the oldest queued message to make room).
+
+A group's policy is fixed by its first member for the lifetime of the region. A later
+member whose options differ is rejected with `std::invalid_argument`, instead of
+silently changing the policy for everyone.
 
 A subscriber is subscribed on construction. `unsubscribe()` makes it ineligible for new
 messages; its private queue keeps what it already holds, and `take()` returns
-`kNotSubscribed` until `subscribe()`. A group member that unsubscribes leaves the group;
-queued group messages stay for the remaining members.
+`kNotSubscribed` until `subscribe()`. A group member that unsubscribes leaves the group.
+Messages queued for the group stay for the remaining members; when the **last** member
+leaves (or dies and is reclaimed), the backlog is discarded, so a group without members
+holds no blocks and a later member does not receive stale work. Membership is a bitmap
+in shared memory, so `GroupInfo::members` is always the number of member slots.
 
 | Call | Result |
 |---|---|
 | `take(read)` | `kOk` with a read-only view; `kWouldBlock` if the queue is empty; `kNotSubscribed`; `kLoanLimit` at `kMaxLoansPerSubscriber` held loans; `kInvalidArgument` for a non-empty `read`; `kCorrupted` if a queued block id or size fails validation (the entry is skipped). |
 | `wait_take(read, timeout)` | Blocks on the queue's futex word. `kTimedOut` at the deadline, `kStopped` after `stop()`. A zero timeout makes one attempt; negative timeouts are invalid. |
 | `receive(buf, size)` / `wait_receive(...)` | Copy variants returning `ReceiveResult{status, size}`. `kBufferTooSmall` reports the size; the message is consumed and not copied. |
+| `take(reads, n)` | Takes up to `n` messages into empty loans (stops at the loan limit or an empty queue) and returns how many. |
+| `drain(fn, max)` | Takes up to `max` messages one at a time, calls `fn(const ReadLoan&)` and releases each before the next; returns how many. |
 | `stop()` | Any thread may call it. Current and future blocking calls return `kStopped`. A stopping group member passes a pending wake-up on to another member. |
 
 `ReadLoan` exposes `data()`, `size()`, `sequence()`, `timestamp_ns()` and
@@ -99,5 +110,6 @@ passed on.
 
 Constructors throw `std::system_error` for system call failures and
 `std::runtime_error` for layout or configuration mismatches, initialization timeouts
-and full slot tables; `Subscriber` throws `std::invalid_argument` for a group outside
-`0..kMaxGroups` and `Topic` throws it for a name that does not begin with `/`.
+and full slot tables (a constructor that races `recover()` waits up to 100 ms and
+rescans before reporting a full table); `Subscriber` throws `std::invalid_argument` for
+a group outside `0..kMaxGroups` or options that conflict with the group's policy, and `Topic` throws it for a name that does not begin with `/`.
