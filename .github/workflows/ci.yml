@@ -32,6 +32,9 @@ jobs:
           build/throughput_benchmark 1 20000 64 --publishers 2 --idle
           build/latency_benchmark 2000 64 futex
           build/control_path_benchmark
+      - name: Chaos
+        if: matrix.compiler == 'g++' && matrix.build_type == 'Release' && matrix.os == 'ubuntu-24.04'
+        run: build/chaos_test 10
 
   sanitizers:
     name: ${{ matrix.name }}
@@ -55,6 +58,18 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=1
           ASAN_OPTIONS: detect_leaks=1
+      - name: Chaos
+        if: matrix.name == 'tsan'
+        run: build/chaos_test 10
+
+  model:
+    name: tla
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y openjdk-21-jre-headless
+      - run: curl -fsSL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.3/tla2tools.jar
+      - run: java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -deadlock -workers 2 -config spec/ShmPubsub.cfg spec/ShmPubsub.tla
 
   format:
     runs-on: ubuntu-24.04

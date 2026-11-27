@@ -24,7 +24,7 @@ share a region. Source changes are small: see the migration notes below.
 - A group's policy is fixed by its first member; a member with different options is
   rejected with `std::invalid_argument`.
 - When the last member leaves a group (or is reclaimed), the group's backlog is
-  discarded instead of holding blocks until a new member arrives.
+  discarded unless the group is durable.
 - Up to 56 endpoints per topic (was 48) and no separate limit on publishers (was 24).
 - Publishers announce their targets in a per-publisher pin mask instead of CASing a
   pin into each subscriber's lifecycle word; owner-written slot words moved to their
@@ -38,6 +38,15 @@ share a region. Source changes are small: see the migration notes below.
 ### Added
 
 - `Config::kTimestamps` (default `true`) to skip the per-publish clock read.
+- `collect_garbage()` repairs holes, claimed cells and in-flight blocks of dead
+  endpoints without a quiescent topic, and falls back to `recover()` only when a leak
+  cannot be attributed. `Options::self_heal` (default on) runs that collection from the
+  data path, at most once per `self_heal_interval`.
+- Work-queue groups: `durable` backlogs, `Delivery::kAtLeastOnce` with
+  `ReadLoan::delivery_count()`, `requeue()` and `max_deliveries` / `dead_lettered`, and
+  `Overflow::kBlock` with `publish(loan, timeout)`.
+- Optional `Config::kLargeBlockCount` / `kLargeBlockSize`, a second free list.
+  `loan()` picks the smallest class that fits.
 - `Publisher::publish(WriteLoan*, n)`, `Subscriber::take(ReadLoan*, n)` and
   `Subscriber::drain(fn, max)`.
 - `membership_test`, `slot_contention_test`, `control_path_benchmark`, and

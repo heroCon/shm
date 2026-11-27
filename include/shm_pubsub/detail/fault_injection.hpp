@@ -10,13 +10,18 @@ namespace detail {
 // point. Builds that define SHM_PUBSUB_FAULT_INJECTION kill the process with
 // SIGKILL on the Nth hit of the point named by SHM_PUBSUB_CRASH_AT=name:N.
 constexpr const char* kFaultPoints[] = {
-    "loan.after_pop",          "loan.after_claim",
-    "publish.after_ref",       "queue.after_reserve",
-    "publish.after_enqueue",   "publish.before_release",
-    "drop_oldest.after_claim", "drop_oldest.after_release_cell",
-    "take.after_claim",        "take.after_convert",
-    "release.before_push",     "reclaim.after_pin_wait",
-    "reclaim.after_mark",
+    "loan.after_pop",           "loan.after_claim",
+    "publish.after_ref",        "queue.after_reserve",
+    "publish.after_enqueue",    "publish.before_release",
+    "drop_oldest.after_claim",  "drop_oldest.after_release_cell",
+    "take.after_claim",         "take.after_convert",
+    "release.before_push",      "reclaim.after_pin_wait",
+    "reclaim.after_mark",       "reclaim.after_resolve",
+    "endpoint.after_construct", "endpoint.before_destroy",
+    "subscribe.after_join",     "unsubscribe.before_leave",
+    "repair.before_tombstone",  "repair.before_cell_release",
+    "redeliver.after_enqueue",  "redeliver.after_convert",
+    "recount.before_cas",       "group.drain_after_release",
 };
 constexpr size_t kFaultPointCount = sizeof(kFaultPoints) / sizeof(kFaultPoints[0]);
 

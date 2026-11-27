@@ -250,8 +250,10 @@ class Topic {
       s.pid.store(static_cast<uint32_t>(getpid()), std::memory_order_relaxed);
       s.stats.init();
       counter_ = topic.activate(slot_);
+      SHM_PUBSUB_FAULT_POINT("endpoint.after_construct");
     }
     ~Publisher() {
+      SHM_PUBSUB_FAULT_POINT("endpoint.before_destroy");
       topic_->reclaim_slot(slot_, nullptr, kReclaimWaitNs, true, nullptr);
       close(fd_);
     }
@@ -642,8 +644,10 @@ class Topic {
       s.stats.init();
       counter_ = topic.activate(slot_);
       subscribe();
+      SHM_PUBSUB_FAULT_POINT("endpoint.after_construct");
     }
     ~Subscriber() {
+      SHM_PUBSUB_FAULT_POINT("endpoint.before_destroy");
       stop();
       unsubscribe();
       topic_->reclaim_slot(slot_, nullptr, kReclaimWaitNs, true, nullptr);
@@ -656,10 +660,12 @@ class Topic {
       if (group_) topic_->join_group(group_, slot_);
       topic_->slot(slot_).subscribed.store(1, std::memory_order_release);
       subscribed_ = true;
+      SHM_PUBSUB_FAULT_POINT("subscribe.after_join");
     }
     // Leaving a non-durable group as its last member discards the backlog.
     void unsubscribe() {
       topic_->slot(slot_).subscribed.store(0, std::memory_order_release);
+      SHM_PUBSUB_FAULT_POINT("unsubscribe.before_leave");
       if (group_) {
         begin(detail::kOpLeave, detail::kNoBlock);
         topic_->leave_group(group_, slot_);
@@ -1474,6 +1480,7 @@ class Topic {
       rec.redelivered.fetch_add(1, std::memory_order_relaxed);
       status = Status::kOk;
     }
+    SHM_PUBSUB_FAULT_POINT("redeliver.after_convert");
     if (reclaiming) {
       clear_holder(id, i);
     } else {

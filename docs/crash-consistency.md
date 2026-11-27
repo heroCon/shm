@@ -48,15 +48,33 @@ by cell repair); none hides a reference.
 
 ## Repair
 
-`collect_garbage()` reclaims dead slots (see [lifecycle](lifecycle.md)) and, if it
-reclaimed any, attempts `recover()` once. `recover()`:
+`collect_garbage()` reclaims dead slots (see [lifecycle](lifecycle.md)) and repairs the
+queue cells they left behind. It does not need a quiescent topic. It waits, bounded by
+100 ms, until every live endpoint that was inside an operation has moved on, then:
+
+- a cell that is still reserved but not committed becomes a tombstone (`holes_filled`);
+- a cell that was claimed and not released is released (`cells_released`), and its queue
+  reference is dropped unless a dead slot's holder bit shows the claimer already
+  converted it;
+- the block a dead publisher was delivering is recounted from the queues and its word
+  is installed by CAS (`blocks_recounted`);
+- a dead member of an at-least-once group has each held block put back on the group
+  queue before its holder bit is cleared.
+
+If a wait times out the slot stays `RECLAIMING` and the next pass resumes it. Where a
+dead owner may have leaked a block that this pass cannot attribute, it sets a shared
+`repair_pending` flag. The next `collect_garbage()`, or the next `loan()` that finds
+the pool empty, then runs `recover()` and clears the flag. `collect_garbage()` takes
+an optional `RecoveryReport`; `full_repair` says that fallback ran.
+
+`recover()` is unchanged in shape:
 
 1. takes the maintenance lock byte, then locks every slot byte it can; those slots are
    dead and are reclaimed;
 2. reads the activity words of the live slots, scans the free list, every block word and
    every queue, then reads the activity words again; any non-idle or changed word
    returns `kBusy`;
-3. recomputes each block's word as (observed live holder bits) | (queue entries << 48)
+3. recomputes each block's word as (observed live holder bits) | (queue entries << 56)
    and installs it by CAS; a block whose word becomes zero is pushed to the free list
    (`orphans_freed`), and clears member bits of dead slots (`members_cleared`);
 4. fills cells a dead producer reserved but never committed with a tombstone that
@@ -97,9 +115,24 @@ later `recover()` to find nothing left to repair.
 | `release.before_push` | Word reached zero, block not yet on the free list | orphan sweep | 1 2 3 5 + gc |
 | `reclaim.after_pin_wait` | A reclaimer died mid-reclaim | next reclaim (idempotent) | 1 2 3 5 + gc |
 | `reclaim.after_mark` | Queue cell marked released, reference not dropped | recompute | 1 2 3 5 + gc |
+| `reclaim.after_resolve` | A reclaimer died after resolving other queues | next reclaim | 1 2 3 5 + gc |
+| `endpoint.after_construct` | Slot activated, constructor not finished | slot reclaim | 1 2 3 5 + gc |
+| `endpoint.before_destroy` | Destructor entered, slot not yet reclaimed | slot reclaim | 1 2 3 5 + gc |
+| `subscribe.after_join` | Joined a group, subscribed flag not yet stored | slot reclaim | 1 2 3 5 + gc |
+| `unsubscribe.before_leave` | Unsubscribed flag stored, membership bit still set | slot reclaim | 1 2 3 5 + gc |
+| `repair.before_tombstone` | A hole was observed, the tombstone not yet stored | next local repair | 1 2 3 5 + gc |
+| `repair.before_cell_release` | A claimed cell was observed, not yet released | next local repair | 1 2 3 5 + gc |
+| `redeliver.after_enqueue` | A redelivered reference is queued, the holder bit remains | next reclaim (duplicates, then converges) | 1 2 3 5 + gc |
+| `redeliver.after_convert` | Same window, immediately before the holder bit is dropped | next reclaim | 1 2 3 5 + gc |
+| `recount.before_cas` | A recounted word was not yet installed | next recount or `recover()` | 1 2 3 5 + gc |
+| `group.drain_after_release` | A drained cell was released, its reference not dropped | recompute | 1 2 3 5 + gc |
 
 "gc" is the `collect_garbage()`-only pass. Run `build/crash_matrix_test` to print the counters
-behind each row. Separately, `crash_leak_test` kills a writer holding two loans, a
+behind each row. `local_repair_test` kills an endpoint while other endpoints keep
+running and checks that `collect_garbage()` alone unblocks the readers.
+`chaos_test` kills publishers for several seconds under busy-polling readers with no
+supervisor, and under blocking readers with `collect_garbage()`, and bounds every
+reader's stall. Separately, `crash_leak_test` kills a writer holding two loans, a
 reader holding a loan, and a reader holding a loan with a backlog, 40 times each, and
 checks that `collect_garbage()` returns the pool to full after every kill.
 
@@ -114,9 +147,12 @@ These are known and deliberate; none silently loses capacity.
   the activity word; measured success with such a reader was 0% even without traffic.
   Since 0.4 empty polls write nothing (measured: 100% idle, 99.6% at 1k msg/s, 81% at
   50k msg/s on a 4-vCPU VM).
-  Until a repair runs, a hole left by a dead producer stops readers of that queue at the
-  hole. Because of the pool budget, only leaks can exhaust the pool, so `loan()` reaching
-  `kPoolExhausted` means repair could not run.
+  A hole left by a dead producer stops readers of that queue only until
+  `collect_garbage()` runs. With `Options::self_heal` (the default) a reader that finds
+  a non-empty queue whose head is not ready, or a publisher that finds a full queue or
+  an empty pool, runs it itself, at most once per `self_heal_interval` (default 10 ms)
+  and only if no other thread in the process is already collecting. `loan()` still
+  reports `kPoolExhausted` only when that repair cannot find a block.
 - **Free-list structure.** A crash cannot corrupt the free list: pop and push each
   commit with a single CAS, and the crash points around them are covered above. If the
   list is found structurally damaged anyway (for example by a stray write into shared
@@ -124,8 +160,11 @@ These are known and deliberate; none silently loses capacity.
   region.
 - **Lost wake-ups.** A publisher killed after enqueueing but before waking a reader
   delays that reader until the next publish, `stop()`, or its timeout.
-- **Lost messages.** The message in flight in the dead process is not redelivered. A
-  group member killed between claiming and converting a message loses it for the group.
+- **Lost messages.** Private subscribers and at-most-once groups do not get the message
+  a dead endpoint was publishing or taking. An at-least-once group puts a message a
+  dead member had claimed or was holding back on the group queue; a crash in the middle
+  of that step can deliver it twice, which that policy allows. Past `max_deliveries`
+  the message is counted in `dead_lettered` and dropped.
 - **Counter wrap.** The free-list ABA tag and activity counters are 32 bits. A false
   match needs exactly 2^32 operations on one slot during a single `recover()` scan.
 - **Creator death before `READY`.** Attachers time out; see [lifecycle](lifecycle.md).

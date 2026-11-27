@@ -24,6 +24,10 @@ static void drain(Topic::Subscriber& sub) {
   while (sub.take(loan) == Status::kOk) loan.reset();
 }
 
+static void crash_reserve(const shm_pubsub::Options& o);
+static void crash_claim(const shm_pubsub::Options& o);
+static void crash_hold(const shm_pubsub::Options& o);
+
 // Exercises every point: loans, fan-out to private and group queues, drops
 // under kDropOldest, takes, releases and the reclamation of a dead reader.
 [[noreturn]] static void victim(const shm_pubsub::Options& o) {
@@ -66,7 +70,68 @@ static void drain(Topic::Subscriber& sub) {
     close(ready[1]);
     topic.collect_garbage();
   }
+
+  // Points the loop above never reaches. Five of each, so hit counts 1, 2, 3
+  // and 5 all land. Children override SHM_PUBSUB_CRASH_AT; this process keeps
+  // its own, so a repair point fires here.
+  for (int n = 0; n < 5; ++n) {
+    Topic::Subscriber temp(topic);
+  }
+  auto child = [&](const char* spec, void (*fn)(const shm_pubsub::Options&)) {
+    const pid_t pid = fork();
+    if (pid == 0) {
+      setenv("SHM_PUBSUB_CRASH_AT", spec, 1);
+      fn(o);
+      _exit(0);
+    }
+    waitpid(pid, nullptr, 0);
+  };
+  for (int n = 0; n < 5; ++n) {
+    child("queue.after_reserve:1", crash_reserve);
+    topic.collect_garbage();
+    child("publish.after_ref:1", crash_reserve);
+    topic.collect_garbage();
+    child("take.after_claim:1", crash_claim);
+    topic.collect_garbage();
+    child("take.after_convert:1", crash_hold);
+    topic.collect_garbage();
+  }
   _exit(0);
+}
+
+static void crash_reserve(const shm_pubsub::Options& o) {
+  Topic topic(o);
+  Topic::Publisher pub(topic);
+  Topic::Subscriber sub(topic);
+  for (int i = 0; i < 8; ++i) pub.publish_copy("h", 1);
+  _exit(0);
+}
+
+static void crash_claim(const shm_pubsub::Options& o) {
+  Topic topic(o);
+  Topic::Publisher pub(topic);
+  SubscriberOptions same;
+  same.group = 1;
+  Topic::Subscriber sub(topic, same);
+  for (;;) {
+    pub.publish_copy("c", 1);
+    Topic::ReadLoan loan;
+    sub.take(loan);
+  }
+}
+
+static void crash_hold(const shm_pubsub::Options& o) {
+  Topic topic(o);
+  SubscriberOptions alo;
+  alo.group = 2;
+  alo.delivery = shm_pubsub::Delivery::kAtLeastOnce;
+  Topic::Subscriber sub(topic, alo);
+  Topic::Publisher pub(topic);
+  for (;;) {
+    pub.publish_copy("a", 1);
+    Topic::ReadLoan loan;
+    sub.take(loan);
+  }
 }
 
 static bool recover_fully(Topic& topic, shm_pubsub::RecoveryReport& report) {
