@@ -45,6 +45,7 @@ struct DefaultConfig {
   static constexpr uint32_t kMaxGroups = 4;
   static constexpr uint32_t kMaxLoansPerPublisher = 2;
   static constexpr uint32_t kMaxLoansPerSubscriber = 2;
+  static constexpr bool kTimestamps = true;  // stamp CLOCK_MONOTONIC on every publish
 };
 
 struct Options {
@@ -93,8 +94,7 @@ class Topic {
   static_assert(kBlockSize % 64 == 0 && kBlockSize > sizeof(detail::BlockHeader),
                 "kBlockSize must be a multiple of 64 larger than the block header");
   static_assert(kBlockCount >= 1 && kBlockCount < detail::kNoBlock, "kBlockCount out of range");
-  static_assert(kMaxPublishers >= 1 && kMaxPublishers <= detail::kMaxPinBits,
-                "kMaxPublishers must be within 1..24");
+  static_assert(kMaxPublishers >= 1, "kMaxPublishers must be at least 1");
   static_assert(kMaxSubscribers >= 1, "kMaxSubscribers must be at least 1");
   static_assert(kSlots <= detail::kMaxHolderBits, "at most 56 endpoints per topic");
   static_assert(kMaxSubscribers + kMaxGroups <= detail::kMaxQueueRefs,
@@ -241,28 +241,37 @@ class Topic {
       const uint64_t seq = slot.next_sequence.load(std::memory_order_relaxed);
       slot.next_sequence.store(seq + 1, std::memory_order_relaxed);
       h.sequence = seq;
-      h.timestamp_ns = detail::monotonic_ns();
+      h.timestamp_ns = Config::kTimestamps ? detail::monotonic_ns() : 0;
       h.publisher = slot_;
 
       begin(detail::kOpPublish, id);
       detail::WakeWord* wake[kMaxSubscribers + kMaxGroups];
       bool wake_all[kMaxSubscribers + kMaxGroups];
       uint32_t wakes = 0;
-      const uint64_t pin = 1ULL << (detail::kPinShift + slot_);
+      uint64_t targets = 0;
       for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
-        auto& s = topic_->slot(j);
-        uint64_t lc = s.lifecycle.load(std::memory_order_acquire);
-        if (detail::lifecycle_state(lc) != detail::kSlotActive ||
-            !s.subscribed.load(std::memory_order_relaxed) ||
-            s.group.load(std::memory_order_relaxed) != 0) {
-          continue;
-        }
-        while (detail::lifecycle_state(lc) == detail::kSlotActive &&
-               !s.lifecycle.compare_exchange_weak(lc, lc | pin, std::memory_order_acq_rel)) {
-        }
-        if (detail::lifecycle_state(lc) != detail::kSlotActive) continue;
-        if (s.subscribed.load(std::memory_order_acquire) &&
+        const auto& s = topic_->slot(j);
+        if (detail::lifecycle_state(s.lifecycle.load(std::memory_order_relaxed)) ==
+                detail::kSlotActive &&
+            s.subscribed.load(std::memory_order_relaxed) &&
             s.group.load(std::memory_order_relaxed) == 0) {
+          targets |= member_bit(j);
+        }
+      }
+      if (targets) {
+        slot.pinned.store(targets, std::memory_order_relaxed);
+        // Pairs with the fence in reclaim_slot(): either this publisher sees
+        // the slot leave ACTIVE, or the reclaimer sees its pin and waits.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (uint64_t pending = targets; pending; pending &= pending - 1) {
+          const uint32_t j = kMaxPublishers + static_cast<uint32_t>(__builtin_ctzll(pending));
+          auto& s = topic_->slot(j);
+          if (detail::lifecycle_state(s.lifecycle.load(std::memory_order_acquire)) !=
+                  detail::kSlotActive ||
+              !s.subscribed.load(std::memory_order_acquire) ||
+              s.group.load(std::memory_order_relaxed) != 0) {
+            continue;
+          }
           ++r.targets;
           const Overflow overflow =
               static_cast<Overflow>(s.overflow.load(std::memory_order_relaxed));
@@ -272,7 +281,7 @@ class Topic {
             wake_all[wakes++] = true;
           }
         }
-        s.lifecycle.fetch_and(~pin, std::memory_order_release);
+        slot.pinned.store(0, std::memory_order_release);
       }
       for (uint32_t g = 1; g <= kMaxGroups; ++g) {
         auto& group = topic_->group(g);
@@ -990,7 +999,7 @@ class Topic {
     return false;
   }
 
-  uint64_t live_publisher_pins() const {
+  uint64_t live_publishers() const {
     uint64_t pins = 0;
     for (uint32_t p = 0; p < kMaxPublishers; ++p) {
       if (detail::ofd_held_elsewhere(fd_, p)) pins |= 1ULL << p;
@@ -1067,23 +1076,18 @@ class Topic {
     begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
     s.subscribed.store(0, std::memory_order_release);
     if (is_publisher_slot(i)) {
-      const uint64_t pin = 1ULL << (detail::kPinShift + i);
-      for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
-        if (slot(j).lifecycle.fetch_and(~pin, std::memory_order_acq_rel) & pin) {
-          if (report) ++report->pins_cleared;
-        }
-      }
+      if (s.pinned.exchange(0, std::memory_order_acq_rel) && report) ++report->pins_cleared;
     } else {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      const uint64_t bit = member_bit(i);
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
       for (;;) {
-        const uint64_t pins = detail::lifecycle_pins(s.lifecycle.load(std::memory_order_acquire));
-        if (!pins) break;
-        const uint64_t dead = pins & ~live_publisher_pins();
-        if (dead) {
-          s.lifecycle.fetch_and(~(dead << detail::kPinShift), std::memory_order_acq_rel);
-          if (report) ++report->pins_cleared;
-          continue;
+        uint64_t waiting = 0;
+        for (uint32_t p = 0; p < kMaxPublishers; ++p) {
+          if (slot(p).pinned.load(std::memory_order_acquire) & bit) waiting |= 1ULL << p;
         }
+        // A dead publisher never touches the queue again; its mask is stale.
+        if (!(waiting & live_publishers())) break;
         if (std::chrono::steady_clock::now() > deadline) {
           end_activity(i, counter);
           return false;
@@ -1225,12 +1229,8 @@ class Topic {
         ++(fixes[k].hole ? rep.holes_filled : rep.cells_released);
       }
     }
-    const uint64_t live_pins = live & ((1ULL << kMaxPublishers) - 1);
-    for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
-      const uint64_t dead =
-          detail::lifecycle_pins(slot(j).lifecycle.load(std::memory_order_acquire)) & ~live_pins;
-      if (dead) {
-        slot(j).lifecycle.fetch_and(~(dead << detail::kPinShift), std::memory_order_acq_rel);
+    for (uint32_t p = 0; p < kMaxPublishers; ++p) {
+      if (!(live & (1ULL << p)) && slot(p).pinned.exchange(0, std::memory_order_acq_rel)) {
         ++rep.pins_cleared;
       }
     }
@@ -1291,7 +1291,7 @@ class Topic {
       info.pid = s.pid.load(std::memory_order_relaxed);
       info.group = s.group.load(std::memory_order_relaxed);
       info.subscribed = s.subscribed.load(std::memory_order_relaxed) != 0;
-      info.pins = detail::lifecycle_pins(lc);
+      info.pins = s.pinned.load(std::memory_order_relaxed);
       info.queue_depth = info.publisher ? 0 : s.queue.size_approx();
       info.held_loans = s.stats.held_loans.load(std::memory_order_relaxed);
       info.op = detail::activity_op(act);

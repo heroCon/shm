@@ -20,21 +20,19 @@ constexpr uint64_t kMagic = 0x53484d5055425355ULL;
 constexpr uint32_t kLayoutVersion = 6;
 constexpr uint32_t kReady = 2;
 
-// Slot lifecycle word: state (bits 0-1), publisher pins (bits 8-31, one per
-// publisher slot) and generation (bits 32-63). Publishers pin an ACTIVE
-// subscriber slot before touching its queue; reclamation waits for live pins.
+// Slot lifecycle word: state (bits 0-1) and generation (bits 32-63). Before
+// touching subscriber queues a publisher announces them in its own `pinned`
+// mask (one bit per subscriber slot) and then rechecks that each is ACTIVE;
+// reclamation marks a slot RECLAIMING and then waits for live publishers'
+// masks to drop its bit. Both sides fence in between (Dekker), so publishers
+// never write to a word that other publishers write.
 constexpr uint64_t kStateMask = 3;
 constexpr uint64_t kSlotFree = 0;
 constexpr uint64_t kSlotActive = 1;
 constexpr uint64_t kSlotReclaiming = 2;
-constexpr unsigned kPinShift = 8;
-constexpr unsigned kMaxPinBits = 24;
 
 inline uint64_t lifecycle_state(uint64_t v) { return v & kStateMask; }
 inline uint32_t lifecycle_generation(uint64_t v) { return static_cast<uint32_t>(v >> 32); }
-inline uint64_t lifecycle_pins(uint64_t v) {
-  return (v >> kPinShift) & ((1ULL << kMaxPinBits) - 1);
-}
 inline uint64_t make_lifecycle(uint32_t generation, uint64_t state) {
   return (static_cast<uint64_t>(generation) << 32) | state;
 }
@@ -83,15 +81,19 @@ struct alignas(64) SlotStats {
   }
 };
 
+// The first cache line is read by every publisher on every publish and
+// written only on activation and reclamation. The second holds words the
+// owner writes on every operation.
 template <uint32_t kQueueCapacity>
 struct alignas(64) Slot {
   std::atomic<uint64_t> lifecycle;
-  std::atomic<uint64_t> activity;
-  std::atomic<uint64_t> next_sequence;
   std::atomic<uint32_t> pid;
   std::atomic<uint32_t> group;
   std::atomic<uint32_t> overflow;
   std::atomic<uint32_t> subscribed;
+  alignas(64) std::atomic<uint64_t> activity;
+  std::atomic<uint64_t> next_sequence;
+  std::atomic<uint64_t> pinned;  // publisher slots: subscriber slots being delivered to
   SlotStats stats;
   MpmcQueue<kQueueCapacity> queue;
 
@@ -99,6 +101,7 @@ struct alignas(64) Slot {
     lifecycle.store(make_lifecycle(0, kSlotFree), std::memory_order_relaxed);
     activity.store(0, std::memory_order_relaxed);
     next_sequence.store(0, std::memory_order_relaxed);
+    pinned.store(0, std::memory_order_relaxed);
     pid.store(0, std::memory_order_relaxed);
     group.store(0, std::memory_order_relaxed);
     overflow.store(0, std::memory_order_relaxed);
@@ -182,6 +185,7 @@ uint64_t config_hash() {
   h = fnv_mix(h, Config::kMaxGroups);
   h = fnv_mix(h, Config::kMaxLoansPerPublisher);
   h = fnv_mix(h, Config::kMaxLoansPerSubscriber);
+  h = fnv_mix(h, Config::kTimestamps ? 1 : 0);
   h = fnv_mix(h, sizeof(Region<Config>));
   h = fnv_mix(h, sizeof(Slot<Config::kQueueCapacity>));
   h = fnv_mix(h, alignof(Region<Config>));
