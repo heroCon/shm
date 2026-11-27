@@ -44,7 +44,22 @@ int main() {
   uint64_t ticks = 0;
   CHECK(read(bridge.fd(), &ticks, sizeof(ticks)) == static_cast<ssize_t>(sizeof(ticks)));
   CHECK(ticks == 1);
+  // The message is still unread. A level-triggered loop would keep writing
+  // the semaphore; one tick is the whole rising edge.
+  CHECK(poll(&pfd, 1, 30) == 0);
   CHECK(sub.take(out) == shm_pubsub::Status::kOk && out.a == 9);
   bridge.stop();
+
+  shm_pubsub::TypedSubscriber<Sample, SmallConfig> stopping(topic);
+  shm_pubsub::EventfdBridge stopped_bridge;
+  CHECK(stopped_bridge.add(stopping.subscriber()));
+  CHECK(stopped_bridge.start() == shm_pubsub::Status::kOk);
+  stopping.subscriber().stop();
+  pfd.fd = stopped_bridge.fd();
+  CHECK(poll(&pfd, 1, 1000) == 1);
+  CHECK(read(stopped_bridge.fd(), &ticks, sizeof(ticks)) == static_cast<ssize_t>(sizeof(ticks)));
+  CHECK(ticks == 1);
+  CHECK(poll(&pfd, 1, 30) == 0);
+  stopped_bridge.stop();
   return finish("typed_test");
 }

@@ -886,31 +886,62 @@ class WaitSet {
   size_t size() const { return handles_.size(); }
   void clear() { handles_.clear(); }
 
+  // kOk when a message is waiting, kWouldBlock when the queue is empty,
+  // kStopped when the subscriber has been stopped.
+  Status observe(size_t index) const {
+    if (index >= handles_.size()) return Status::kInvalidArgument;
+    if (!handles_[index].running->load(std::memory_order_acquire)) return Status::kStopped;
+    if (handles_[index].ready(handles_[index].source)) return Status::kOk;
+    return Status::kWouldBlock;
+  }
+
   // On kOk, *ready_index names a subscriber in insertion order.
   Status wait(std::chrono::milliseconds timeout, size_t* ready_index) {
+    return wait_masked(timeout, ready_index, &skip_none);
+  }
+
+  // `skip(i)` leaves that subscriber out of the poll and the futex wait.
+  // An empty selection returns kWouldBlock without sleeping.
+  template <class Skip>
+  Status wait_masked(std::chrono::milliseconds timeout, size_t* ready_index, Skip skip) {
     if (timeout.count() < 0 || !ready_index || handles_.empty()) return Status::kInvalidArgument;
     if (!supported()) return Status::kNotSupported;
     const uint64_t deadline =
         detail::monotonic_ns() + static_cast<uint64_t>(timeout.count()) * 1000000ULL;
-    std::vector<detail::FutexWaitv> waits(handles_.size());
+    std::vector<detail::FutexWaitv> waits;
+    std::vector<size_t> armed;
+    waits.reserve(handles_.size());
+    armed.reserve(handles_.size());
     for (;;) {
-      Status status = poll(ready_index);
+      Status status = poll_masked(ready_index, skip);
       if (status != Status::kWouldBlock) return status;
+      size_t selected = 0;
       for (size_t i = 0; i < handles_.size(); ++i) {
+        if (!skip(i)) ++selected;
+      }
+      if (selected == 0) return Status::kWouldBlock;
+      armed.clear();
+      for (size_t i = 0; i < handles_.size(); ++i) {
+        if (skip(i)) continue;
         handles_[i].waiters->fetch_add(1, std::memory_order_seq_cst);
+        armed.push_back(i);
       }
       std::atomic_thread_fence(std::memory_order_seq_cst);
-      for (size_t i = 0; i < handles_.size(); ++i) {
-        waits[i].val = handles_[i].generation->load(std::memory_order_acquire);
-        waits[i].uaddr = reinterpret_cast<uint64_t>(detail::futex_address(handles_[i].generation));
-        waits[i].flags = detail::kFutex2SizeU32;
-        waits[i].reserved = 0;
+      waits.clear();
+      for (size_t n = 0; n < armed.size(); ++n) {
+        const detail::WaitHandle& handle = handles_[armed[n]];
+        detail::FutexWaitv word;
+        word.val = handle.generation->load(std::memory_order_acquire);
+        word.uaddr = reinterpret_cast<uint64_t>(detail::futex_address(handle.generation));
+        word.flags = detail::kFutex2SizeU32;
+        word.reserved = 0;
+        waits.push_back(word);
       }
-      status = poll(ready_index);
+      status = poll_masked(ready_index, skip);
       if (status == Status::kWouldBlock && detail::monotonic_ns() >= deadline) {
         status = Status::kTimedOut;
       }
-      if (status == Status::kWouldBlock) {
+      if (status == Status::kWouldBlock && !waits.empty()) {
         const timespec abs = detail::to_timespec(deadline);
         const long rc = syscall(detail::kSysFutexWaitv, waits.data(),
                                 static_cast<unsigned>(waits.size()), 0, &abs, CLOCK_MONOTONIC);
@@ -918,22 +949,27 @@ class WaitSet {
           status = Status::kNotSupported;
         }
       }
-      for (size_t i = 0; i < handles_.size(); ++i) {
-        handles_[i].waiters->fetch_sub(1, std::memory_order_release);
+      for (size_t n = 0; n < armed.size(); ++n) {
+        handles_[armed[n]].waiters->fetch_sub(1, std::memory_order_release);
       }
       if (status != Status::kWouldBlock) return status;
     }
   }
 
  private:
-  Status poll(size_t* ready_index) const {
+  static bool skip_none(size_t) { return false; }
+
+  template <class Skip>
+  Status poll_masked(size_t* ready_index, Skip skip) const {
     for (size_t i = 0; i < handles_.size(); ++i) {
+      if (skip(i)) continue;
       if (!handles_[i].running->load(std::memory_order_acquire)) {
         *ready_index = i;
         return Status::kStopped;
       }
     }
     for (size_t i = 0; i < handles_.size(); ++i) {
+      if (skip(i)) continue;
       if (handles_[i].ready(handles_[i].source)) {
         *ready_index = i;
         return Status::kOk;
@@ -3193,21 +3229,35 @@ class TypedSubscriber {
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 
 namespace shm_pubsub {
 
 // A thread that waits on a WaitSet and writes to an eventfd, so an epoll or
 // libuv loop can wake on subscribers without depending on futex_waitv itself.
-// The eventfd is a semaphore: one successful wait produces one read.
+//
+// The eventfd is an edge-triggered semaphore. A subscriber produces one tick
+// when it becomes ready, and another only after it has been observed empty
+// again, so an unread message does not spin the counter. The caller should
+// drain that subscriber after each tick. A stopped subscriber produces one
+// tick and is then dropped; when none remain, the thread exits.
 class EventfdBridge {
  public:
   EventfdBridge() : fd_(eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE | EFD_NONBLOCK)) {
     if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "eventfd");
   }
-  ~EventfdBridge() { stop(); }
+  ~EventfdBridge() {
+    stop();
+    if (fd_ >= 0) {
+      close(fd_);
+      fd_ = -1;
+    }
+  }
 
   EventfdBridge(const EventfdBridge&) = delete;
   EventfdBridge& operator=(const EventfdBridge&) = delete;
@@ -3236,11 +3286,40 @@ class EventfdBridge {
   }
 
  private:
+  // 0: idle or not yet reported, 1: ready and already signaled, 2: dropped.
   void run() {
+    const size_t count = set_.size();
+    std::vector<unsigned char> state(count, 0);
     while (!stop_.load(std::memory_order_acquire)) {
+      bool need_wait = false;
+      bool any_live = false;
+      for (size_t i = 0; i < count; ++i) {
+        if (state[i] == 2) continue;
+        any_live = true;
+        const Status status = set_.observe(i);
+        if (status == Status::kStopped) {
+          signal();
+          state[i] = 2;
+        } else if (status == Status::kOk) {
+          if (state[i] == 0) signal();
+          state[i] = 1;
+        } else {
+          state[i] = 0;
+          need_wait = true;
+        }
+      }
+      if (!any_live || stop_.load(std::memory_order_acquire)) break;
+      if (!need_wait) {
+        // Every live subscriber is still ready and already signaled. Sleep
+        // until the consumer drains one; there is no futex for "not ready".
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
       size_t index = 0;
-      const Status status = set_.wait(std::chrono::milliseconds(20), &index);
-      if (status == Status::kOk || status == Status::kStopped) signal();
+      const Status status = set_.wait_masked(std::chrono::milliseconds(20), &index,
+                                             [&state](size_t i) { return state[i] != 0; });
+      (void)index;
+      if (status == Status::kNotSupported || status == Status::kInvalidArgument) break;
     }
   }
 
@@ -3266,6 +3345,7 @@ class EventfdBridge {
 #include <linux/futex.h>
 #include <linux/io_uring.h>
 
+#include <atomic>
 #include <cstdint>
 
 
@@ -3275,22 +3355,49 @@ namespace shm_pubsub {
 // Linux 6.7+ and a kernel that accepts the opcode; older kernels return
 // EINVAL or ENOSYS from io_uring_enter and the caller should fall back to
 // EventfdBridge.
+//
+// `waiters` stays incremented from arm_futex_wait until disarm_futex_wait.
+// Publishers skip the generation increment when that count is zero, so a wait
+// submitted without arming never completes on publish.
 struct FutexWait {
   uint32_t* address;
   uint64_t expected;
   uint64_t mask;
   uint32_t futex_flags;
+  std::atomic<uint32_t>* waiters;
+  bool armed;
 };
 
+// Increments the subscriber's waiter count, then samples the generation.
+// *should_wait is false when the subscriber is already ready or stopped:
+// submitting the futex wait is unnecessary, but disarm_futex_wait is still
+// required. When *should_wait is true, submit `wait` and disarm only after
+// the completion (or after cancelling the SQE).
 template <class Subscriber>
-FutexWait futex_wait_for(Subscriber& subscriber) {
+FutexWait arm_futex_wait(Subscriber& subscriber, bool* should_wait) {
   const detail::WaitHandle handle = subscriber.wait_handle();
+  handle.waiters->fetch_add(1, std::memory_order_seq_cst);
+  // Pairs with the relaxed load in Publisher::wake. A publish that lands
+  // after the increment and before the sample either bumps the generation
+  // this sample observes, or is visible to the readiness check below.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   FutexWait out;
   out.address = detail::futex_address(handle.generation);
   out.expected = handle.generation->load(std::memory_order_acquire);
   out.mask = FUTEX_BITSET_MATCH_ANY;
   out.futex_flags = FUTEX2_SIZE_U32;
+  out.waiters = handle.waiters;
+  out.armed = true;
+  const bool running = handle.running->load(std::memory_order_acquire);
+  const bool ready = handle.ready(handle.source);
+  if (should_wait) *should_wait = running && !ready;
   return out;
+}
+
+inline void disarm_futex_wait(FutexWait* wait) {
+  if (!wait || !wait->armed || !wait->waiters) return;
+  wait->waiters->fetch_sub(1, std::memory_order_release);
+  wait->armed = false;
 }
 
 // Fills a kernel SQE the way liburing's io_uring_prep_futex_wait does.
