@@ -46,6 +46,11 @@ struct DefaultConfig {
   static constexpr uint32_t kMaxLoansPerPublisher = 2;
   static constexpr uint32_t kMaxLoansPerSubscriber = 2;
   static constexpr bool kTimestamps = true;  // stamp CLOCK_MONOTONIC on every publish
+  // Optional second pool for payloads that do not fit kBlockSize. Loans pick
+  // the smallest class that fits; the large class is outside the
+  // no-exhaustion guarantee unless it alone meets kRequiredBlocks.
+  static constexpr uint32_t kLargeBlockCount = 0;
+  static constexpr uint32_t kLargeBlockSize = 0;
 };
 
 struct Options {
@@ -53,11 +58,22 @@ struct Options {
   mode_t mode = 0660;
   bool unlink_on_destroy = false;
   std::chrono::milliseconds initialization_timeout{5000};
+  // Endpoints that notice a symptom of a dead peer (a full or stalled queue,
+  // an exhausted pool) run collect_garbage() themselves, at most once per
+  // interval per process and only if no other thread is collecting.
+  bool self_heal = true;
+  std::chrono::microseconds self_heal_interval{10000};
+  // How long a publish waits for room in a full kBlock group queue.
+  std::chrono::milliseconds block_timeout{1000};
 };
 
 struct SubscriberOptions {
   uint32_t group = 0;  // 0: private queue (broadcast); 1..kMaxGroups: competing group
   Overflow overflow = Overflow::kDropNewest;
+  // Group policy, fixed by the first member; later members must match.
+  bool durable = false;  // keep the backlog when the last member leaves
+  Delivery delivery = Delivery::kAtMostOnce;
+  uint32_t max_deliveries = 0;  // 0: unlimited; otherwise at most 254
 };
 
 struct RecoveryReport {
@@ -68,7 +84,12 @@ struct RecoveryReport {
   uint32_t cells_released = 0;
   uint32_t pins_cleared = 0;
   uint32_t members_cleared = 0;
+  uint32_t blocks_recounted = 0;
   uint32_t inconsistencies = 0;
+  // collect_garbage() only: local repair could not rule out a leaked block,
+  // so it also ran recover(); `full_repair_status` is that call's result.
+  bool full_repair = false;
+  Status full_repair_status = Status::kOk;
 };
 
 template <class Config = DefaultConfig>
@@ -85,6 +106,12 @@ class Topic {
   static constexpr uint32_t kLoanEntries = detail::loan_entries<Config>();
   static constexpr uint32_t kSlots = kMaxPublishers + kMaxSubscribers;
   static constexpr size_t kMaxPayload = kBlockSize - sizeof(detail::BlockHeader);
+  static constexpr uint32_t kLargeBlockCount = Config::kLargeBlockCount;
+  static constexpr uint32_t kLargeBlockSize = Config::kLargeBlockSize;
+  // Block ids at or above kBlockCount index the large class.
+  static constexpr uint32_t kBlockIds = kBlockCount + kLargeBlockCount;
+  static constexpr size_t kMaxLargePayload =
+      kLargeBlockCount ? kLargeBlockSize - sizeof(detail::BlockHeader) : 0;
   // Every reference a block can have is bounded, so a pool of this size can
   // never be exhausted by slow or stalled subscribers.
   static constexpr uint64_t kRequiredBlocks =
@@ -94,7 +121,10 @@ class Topic {
 
   static_assert(kBlockSize % 64 == 0 && kBlockSize > sizeof(detail::BlockHeader),
                 "kBlockSize must be a multiple of 64 larger than the block header");
-  static_assert(kBlockCount >= 1 && kBlockCount < detail::kNoBlock, "kBlockCount out of range");
+  static_assert(kBlockCount >= 1 && kBlockIds < detail::kNoBlock, "kBlockCount out of range");
+  static_assert(kLargeBlockCount == 0 ||
+                    (kLargeBlockSize % 64 == 0 && kLargeBlockSize > kBlockSize),
+                "kLargeBlockSize must be a multiple of 64 larger than kBlockSize");
   static_assert(kMaxPublishers >= 1, "kMaxPublishers must be at least 1");
   static_assert(kMaxSubscribers >= 1, "kMaxSubscribers must be at least 1");
   static_assert(kSlots <= detail::kMaxHolderBits, "at most 56 endpoints per topic");
@@ -133,9 +163,10 @@ class Topic {
     explicit operator bool() const { return owner_ != nullptr; }
     char* data() { return owner_ ? owner_->topic_->payload(id_) : nullptr; }
     size_t size() const { return owner_ ? owner_->topic_->header(id_).size : 0; }
-    static constexpr size_t capacity() { return kMaxPayload; }
+    // Payload bytes this loan's block holds (depends on its size class).
+    size_t capacity() const { return owner_ ? owner_->topic_->payload_capacity(id_) : 0; }
     bool resize(size_t size) {
-      if (!owner_ || size == 0 || size > kMaxPayload) return false;
+      if (!owner_ || size == 0 || size > capacity()) return false;
       owner_->topic_->header(id_).size = static_cast<uint32_t>(size);
       return true;
     }
@@ -154,7 +185,8 @@ class Topic {
    public:
     ReadLoan() {}
     ~ReadLoan() { reset(); }
-    ReadLoan(ReadLoan&& other) noexcept : owner_(other.owner_), id_(other.id_) {
+    ReadLoan(ReadLoan&& other) noexcept
+        : owner_(other.owner_), id_(other.id_), delivery_(other.delivery_) {
       other.owner_ = nullptr;
     }
     ReadLoan& operator=(ReadLoan&& other) noexcept {
@@ -162,6 +194,7 @@ class Topic {
         reset();
         owner_ = other.owner_;
         id_ = other.id_;
+        delivery_ = other.delivery_;
         other.owner_ = nullptr;
       }
       return *this;
@@ -177,15 +210,29 @@ class Topic {
     // CLOCK_MONOTONIC time at publication.
     uint64_t timestamp_ns() const { return owner_ ? owner_->topic_->header(id_).timestamp_ns : 0; }
     uint32_t publisher_id() const { return owner_ ? owner_->topic_->header(id_).publisher : 0; }
+    // 1 on the first delivery; higher when a group redelivered the message
+    // after a member requeued it or died holding it.
+    uint32_t delivery_count() const { return owner_ ? delivery_ : 0; }
     void reset() {
       if (owner_) owner_->release_loan(id_);
       owner_ = nullptr;
+    }
+    // Group members only: hands the message back to the group queue for
+    // another delivery and consumes the loan. kDeadLettered: the group's
+    // max_deliveries was reached, so the message was dropped (and the loan
+    // consumed). kQueueFull: nothing changed; the loan is kept.
+    Status requeue() {
+      if (!owner_) return Status::kInvalidArgument;
+      const Status status = owner_->requeue_loan(id_, delivery_);
+      if (status == Status::kOk || status == Status::kDeadLettered) owner_ = nullptr;
+      return status;
     }
 
    private:
     friend class Topic;
     Subscriber* owner_ = nullptr;
     uint32_t id_ = 0;
+    uint32_t delivery_ = 0;
   };
 
   // A publisher endpoint. Not thread-safe: use one per thread.
@@ -203,9 +250,11 @@ class Topic {
       s.pid.store(static_cast<uint32_t>(getpid()), std::memory_order_relaxed);
       s.stats.init();
       counter_ = topic.activate(slot_);
+      SHM_PUBSUB_FAULT_POINT("endpoint.after_construct");
     }
     ~Publisher() {
-      topic_->reclaim_slot(slot_, nullptr);
+      SHM_PUBSUB_FAULT_POINT("endpoint.before_destroy");
+      topic_->reclaim_slot(slot_, nullptr, kReclaimWaitNs, true, nullptr);
       close(fd_);
     }
     Publisher(const Publisher&) = delete;
@@ -213,14 +262,18 @@ class Topic {
 
     Status loan(size_t size, WriteLoan& out) {
       if (out || size == 0) return Status::kInvalidArgument;
-      if (size > kMaxPayload) return Status::kMessageTooLarge;
+      if (size > max_payload_size()) return Status::kMessageTooLarge;
       if (held_ >= kMaxLoansPerPublisher) return Status::kLoanLimit;
       uint32_t id;
       if (!try_loan(size, id)) {
-        topic_->collect_garbage();
-        if (!try_loan(size, id)) {
-          topic_->recover(nullptr);
-          if (!try_loan(size, id)) return Status::kPoolExhausted;
+        if (topic_->options_.self_heal) {
+          if (!topic_->heal(true) || !try_loan(size, id)) return Status::kPoolExhausted;
+        } else {
+          topic_->collect_garbage();
+          if (!try_loan(size, id)) {
+            topic_->recover(nullptr);
+            if (!try_loan(size, id)) return Status::kPoolExhausted;
+          }
         }
       }
       out.owner_ = this;
@@ -236,7 +289,18 @@ class Topic {
       }
       const uint32_t id = sample.id_;
       sample.owner_ = nullptr;
-      return publish_ids(&id, 1);
+      return publish_ids(&id, 1, topic_->options_.block_timeout);
+    }
+    // As publish(), waiting at most `timeout` for room in full kBlock group
+    // queues; the status is kTimedOut if any of them stayed full.
+    PublishResult publish(WriteLoan&& sample, std::chrono::milliseconds timeout) {
+      if (sample.owner_ != this || timeout.count() < 0) {
+        PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
+        return r;
+      }
+      const uint32_t id = sample.id_;
+      sample.owner_ = nullptr;
+      return publish_ids(&id, 1, timeout);
     }
 
     // Publishes up to kMaxLoansPerPublisher loans in order with one pin pass,
@@ -255,12 +319,12 @@ class Topic {
         ids[k] = samples[k].id_;
       }
       for (size_t k = 0; k < count; ++k) samples[k].owner_ = nullptr;
-      return publish_ids(ids, count);
+      return publish_ids(ids, count, topic_->options_.block_timeout);
     }
     PublishResult publish_copy(const void* data, size_t size) {
       PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
       if (!data || size == 0) return r;
-      if (size > kMaxPayload) {
+      if (size > max_payload_size()) {
         r.status = Status::kMessageTooLarge;
         return r;
       }
@@ -286,7 +350,8 @@ class Topic {
     void begin(uint32_t op, uint32_t id) { topic_->begin_activity(slot_, counter_, op, id); }
     void end() { topic_->end_activity(slot_, counter_); }
 
-    PublishResult publish_ids(const uint32_t* ids, size_t count) {
+    PublishResult publish_ids(const uint32_t* ids, size_t count,
+                              std::chrono::milliseconds timeout) {
       PublishResult r = {Status::kOk, 0, 0, 0};
       auto& slot = topic_->slot(slot_);
       uint64_t seq = slot.next_sequence.load(std::memory_order_relaxed);
@@ -327,6 +392,11 @@ class Topic {
       }
       uint64_t woken = 0;
       uint32_t group_wakes[kMaxGroups + 1] = {};
+      // Per kBlock group, the first message that found its queue full; it
+      // and every later message wait for room after this pass, in order.
+      size_t blocked_from[kMaxGroups + 1];
+      for (uint32_t g = 0; g <= kMaxGroups; ++g) blocked_from[g] = count;
+      bool any_blocked = false;
       for (size_t k = 0; k < count; ++k) {
         const uint32_t id = ids[k];
         begin(detail::kOpPublish, id);
@@ -343,6 +413,7 @@ class Topic {
         }
         for (uint32_t g = 1; g <= kMaxGroups; ++g) {
           auto& group = topic_->group(g);
+          if (blocked_from[g] < k) continue;
           if (group.member_mask.load(std::memory_order_acquire) == 0) continue;
           ++r.targets;
           const Overflow overflow = static_cast<Overflow>(
@@ -350,10 +421,14 @@ class Topic {
           if (deliver(group.queue, id, overflow, group.dropped_newest, group.dropped_oldest, r)) {
             ++r.delivered;
             ++group_wakes[g];
+          } else if (overflow == Overflow::kBlock) {
+            blocked_from[g] = k;
+            any_blocked = true;
           }
         }
         SHM_PUBSUB_FAULT_POINT("publish.before_release");
-        drop_own(id);
+        // A message still owed to a blocked group stays loaned until then.
+        if (!any_blocked) drop_own(id);
         end();
       }
       if (targets) slot.pinned.store(0, std::memory_order_release);
@@ -369,9 +444,14 @@ class Topic {
       for (uint32_t g = 1; g <= kMaxGroups; ++g) {
         if (group_wakes[g]) wake(topic_->group(g).queue.wake, static_cast<int>(group_wakes[g]));
       }
+      const bool timed_out = any_blocked && !publish_blocked(ids, count, blocked_from, timeout, r);
       slot.stats.published.store(slot.stats.published.load(std::memory_order_relaxed) + count,
                                  std::memory_order_relaxed);
-      if (r.targets == 0) {
+      // A queue that stays full may be stuck behind a dead endpoint's cell.
+      if (r.delivered < r.targets) topic_->heal(false);
+      if (timed_out) {
+        r.status = Status::kTimedOut;
+      } else if (r.targets == 0) {
         r.status = Status::kNoSubscribers;
       } else if (r.delivered == 0) {
         r.status = Status::kQueueFull;
@@ -379,6 +459,71 @@ class Topic {
         r.status = Status::kPartial;
       }
       return r;
+    }
+
+    // Runs outside any operation and without pins, so a sleeping publisher
+    // holds up neither repair nor reclamation; only its loans stay held.
+    // Returns false if some group stayed full until the deadline.
+    bool publish_blocked(const uint32_t* ids, size_t count, const size_t* blocked_from,
+                         std::chrono::milliseconds timeout, PublishResult& r) {
+      const uint64_t deadline =
+          detail::monotonic_ns() + static_cast<uint64_t>(timeout.count()) * 1000000ULL;
+      bool all = true;
+      bool gave_up[kMaxGroups + 1] = {};
+      size_t first = count;
+      for (uint32_t g = 1; g <= kMaxGroups; ++g) first = std::min(first, blocked_from[g]);
+      for (size_t k = first; k < count; ++k) {
+        const uint32_t id = ids[k];
+        for (uint32_t g = 1; g <= kMaxGroups; ++g) {
+          if (blocked_from[g] > k) continue;
+          auto& group = topic_->group(g);
+          if (blocked_from[g] < k) ++r.targets;
+          if (!gave_up[g] && deliver_blocking(group, id, deadline)) {
+            ++r.delivered;
+          } else {
+            gave_up[g] = true;
+            all = false;
+            group.dropped_newest.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        begin(detail::kOpRelease, id);
+        drop_own(id);
+        end();
+      }
+      return all;
+    }
+
+    bool deliver_blocking(detail::GroupRecord<kQueueCapacity>& group, uint32_t id,
+                          uint64_t deadline) {
+      detail::WakeWord& w = group.space;
+      PublishResult ignored = {Status::kOk, 0, 0, 0};
+      for (;;) {
+        w.waiters.fetch_add(1, std::memory_order_seq_cst);
+        // Pairs with the fence in wake_space(): either this
+        // attempt sees the freed cell, or the consumer sees the waiter.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const uint32_t generation = w.generation.load(std::memory_order_acquire);
+        begin(detail::kOpPublish, id);
+        const bool ok = group.member_mask.load(std::memory_order_acquire) != 0 &&
+                        deliver(group.queue, id, Overflow::kBlock, group.dropped_newest,
+                                group.dropped_oldest, ignored);
+        end();
+        const uint64_t now = detail::monotonic_ns();
+        if (ok || now >= deadline || group.member_mask.load(std::memory_order_acquire) == 0) {
+          w.waiters.fetch_sub(1, std::memory_order_release);
+          if (ok) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            wake(group.queue.wake, 1);
+          }
+          return ok;
+        }
+        uint64_t sleep_ns = deadline - now;
+        if (topic_->options_.self_heal) sleep_ns = std::min(sleep_ns, topic_->heal_interval_ns());
+        const timespec relative = detail::to_timespec(sleep_ns);
+        detail::futex_wait(&w.generation, generation, &relative);
+        w.waiters.fetch_sub(1, std::memory_order_release);
+        topic_->heal(false);
+      }
     }
 
     static void wake(detail::WakeWord& w, int count) {
@@ -389,7 +534,7 @@ class Topic {
 
     bool try_loan(size_t size, uint32_t& id) {
       begin(detail::kOpLoan, detail::kNoBlock);
-      if (!topic_->region_->free_list.pop(id)) {
+      if (!topic_->pop_free(size, id)) {
         end();
         return false;
       }
@@ -418,16 +563,23 @@ class Topic {
           SHM_PUBSUB_FAULT_POINT("publish.after_enqueue");
           return true;
         }
+        if (overflow == Overflow::kBlock) {
+          // The caller retries once it is outside the operation.
+          h.state.fetch_sub(detail::kQueueUnit, std::memory_order_relaxed);
+          return false;
+        }
         if (overflow != Overflow::kDropOldest || attempt == 2) break;
+        if (attempt == 0) topic_->mark_dropping(slot_);
         uint64_t pos;
         uint32_t old;
         if (queue.try_claim(pos, old)) {
+          old = old == detail::kTombstone ? old : detail::cell_block(old);
           SHM_PUBSUB_FAULT_POINT("drop_oldest.after_claim");
           // Release the cell before the reference: reclamation of a dead
           // subscriber treats an unreleased claimed cell as still referenced.
           queue.release(pos);
           SHM_PUBSUB_FAULT_POINT("drop_oldest.after_release_cell");
-          if (old < kBlockCount) topic_->release_bits(old, detail::kQueueUnit);
+          if (old < kBlockIds) topic_->release_bits(old, detail::kQueueUnit);
           dropped_oldest.fetch_add(1, std::memory_order_relaxed);
           ++r.dropped_oldest;
         }
@@ -464,9 +616,19 @@ class Topic {
     explicit Subscriber(Topic& topic, const SubscriberOptions& options = SubscriberOptions())
         : topic_(&topic), group_(options.group) {
       if (options.group > kMaxGroups) throw std::invalid_argument("subscriber group out of range");
+      if (!group_ && (options.overflow == Overflow::kBlock || options.durable ||
+                      options.delivery != Delivery::kAtMostOnce || options.max_deliveries)) {
+        throw std::invalid_argument("kBlock, durable, delivery and max_deliveries need a group");
+      }
+      if (options.max_deliveries > detail::kMaxDeliveryCount) {
+        throw std::invalid_argument("max_deliveries out of range");
+      }
       if (group_) {
         topic.claim_group_policy(
-            group_, detail::make_policy(static_cast<uint32_t>(options.overflow), false, 0, 0));
+            group_,
+            detail::make_policy(static_cast<uint32_t>(options.overflow), options.durable,
+                                static_cast<uint32_t>(options.delivery), options.max_deliveries));
+        wakes_space_ = options.overflow == Overflow::kBlock;
       }
       fd_ = topic.open_endpoint_fd();
       try {
@@ -482,11 +644,13 @@ class Topic {
       s.stats.init();
       counter_ = topic.activate(slot_);
       subscribe();
+      SHM_PUBSUB_FAULT_POINT("endpoint.after_construct");
     }
     ~Subscriber() {
+      SHM_PUBSUB_FAULT_POINT("endpoint.before_destroy");
       stop();
       unsubscribe();
-      topic_->reclaim_slot(slot_, nullptr);
+      topic_->reclaim_slot(slot_, nullptr, kReclaimWaitNs, true, nullptr);
       close(fd_);
     }
     Subscriber(const Subscriber&) = delete;
@@ -496,10 +660,12 @@ class Topic {
       if (group_) topic_->join_group(group_, slot_);
       topic_->slot(slot_).subscribed.store(1, std::memory_order_release);
       subscribed_ = true;
+      SHM_PUBSUB_FAULT_POINT("subscribe.after_join");
     }
     // Leaving a non-durable group as its last member discards the backlog.
     void unsubscribe() {
       topic_->slot(slot_).subscribed.store(0, std::memory_order_release);
+      SHM_PUBSUB_FAULT_POINT("unsubscribe.before_leave");
       if (group_) {
         begin(detail::kOpLeave, detail::kNoBlock);
         topic_->leave_group(group_, slot_);
@@ -523,44 +689,53 @@ class Topic {
       auto& queue = source();
       // An empty poll writes nothing, so idle busy-polling readers do not
       // keep recover() from observing a quiescent snapshot.
-      if (!queue.head_ready()) return Status::kWouldBlock;
+      if (!queue.head_ready()) {
+        if (topic_->options_.self_heal) watch_stall(queue);
+        return Status::kWouldBlock;
+      }
+      stalled_since_ = 0;
       begin(detail::kOpTake, detail::kNoBlock);
       for (;;) {
         uint64_t pos;
-        uint32_t id;
-        if (!queue.try_claim(pos, id)) {
+        uint32_t cell;
+        if (!queue.try_claim(pos, cell)) {
           end();
           return Status::kWouldBlock;
         }
         SHM_PUBSUB_FAULT_POINT("take.after_claim");
-        if (id == detail::kTombstone) {
+        if (cell == detail::kTombstone) {
           queue.release(pos);
+          if (wakes_space_) topic_->wake_space(group_);
           continue;
         }
-        if (id >= kBlockCount) {
+        const uint32_t id = detail::cell_block(cell);
+        if (id >= kBlockIds) {
           queue.release(pos);
           end();
           return Status::kCorrupted;
         }
         // One atomic step turns the queue reference into this slot's holder
         // bit, so a crash leaves exactly one of the two.
-        topic_->record_loan(slot_, id);
+        topic_->record_loan(slot_, cell);
         topic_->header(id).state.fetch_add((1ULL << slot_) - detail::kQueueUnit,
                                            std::memory_order_acq_rel);
         SHM_PUBSUB_FAULT_POINT("take.after_convert");
         queue.release(pos);
         end();
+        if (wakes_space_) topic_->wake_space(group_);
         ++held_;
         auto& stats = topic_->slot(slot_).stats;
         stats.held_loans.store(held_, std::memory_order_relaxed);
         stats.taken.store(stats.taken.load(std::memory_order_relaxed) + 1,
                           std::memory_order_relaxed);
-        if (topic_->header(id).size == 0 || topic_->header(id).size > kMaxPayload) {
+        if (topic_->header(id).size == 0 ||
+            topic_->header(id).size > topic_->payload_capacity(id)) {
           release_loan(id);
           return Status::kCorrupted;
         }
         out.owner_ = this;
         out.id_ = id;
+        out.delivery_ = detail::cell_attempt(cell) + 1;
         return Status::kOk;
       }
     }
@@ -610,7 +785,10 @@ class Topic {
           w.waiters.fetch_sub(1, std::memory_order_release);
           return status;
         }
-        const timespec relative = detail::to_timespec(deadline - now);
+        uint64_t sleep_ns = deadline - now;
+        // Wake up periodically so take() can notice a stalled queue.
+        if (topic_->options_.self_heal) sleep_ns = std::min(sleep_ns, topic_->heal_interval_ns());
+        const timespec relative = detail::to_timespec(sleep_ns);
         const long rc = detail::futex_wait(&w.generation, generation, &relative);
         const int error = errno;
         w.waiters.fetch_sub(1, std::memory_order_release);
@@ -645,6 +823,21 @@ class Topic {
     using Queue = detail::MpmcQueue<kQueueCapacity>;
 
     Queue& source() { return group_ ? topic_->group(group_).queue : topic_->slot(slot_).queue; }
+
+    // Entries queued behind an unready head for a whole interval suggest a
+    // cell a dead endpoint left behind.
+    void watch_stall(const Queue& queue) {
+      if (queue.size_approx() == 0) {
+        stalled_since_ = 0;
+        return;
+      }
+      const uint64_t now = detail::monotonic_ns();
+      if (stalled_since_ == 0) {
+        stalled_since_ = now;
+      } else if (now - stalled_since_ >= topic_->heal_interval_ns()) {
+        topic_->heal(false);
+      }
+    }
     static bool queue_ready(const void* queue) {
       return static_cast<const Queue*>(queue)->head_ready();
     }
@@ -687,13 +880,30 @@ class Topic {
       topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
     }
 
+    Status requeue_loan(uint32_t id, uint32_t delivered) {
+      if (!group_) return Status::kInvalidArgument;
+      begin(detail::kOpRequeue, id);
+      const Status status = topic_->redeliver(group_, id, delivered, slot_, false);
+      end();
+      if (status == Status::kQueueFull) return status;
+      --held_;
+      topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
+      if (status == Status::kOk) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        Publisher::wake(source().wake, 1);
+      }
+      return status;
+    }
+
     Topic* topic_;
     uint32_t group_;
     int fd_ = -1;
     uint32_t slot_ = 0;
     uint32_t held_ = 0;
     uint64_t counter_ = 0;
+    uint64_t stalled_since_ = 0;
     bool subscribed_ = false;
+    bool wakes_space_ = false;
     std::atomic<bool> running_{true};
   };
 
@@ -722,9 +932,14 @@ class Topic {
     uint64_t member_mask;
     bool policy_set;
     Overflow overflow;
+    bool durable;
+    Delivery delivery;
+    uint32_t max_deliveries;
     uint64_t queue_depth;
     uint64_t dropped_newest;
     uint64_t dropped_oldest;
+    uint64_t redelivered;
+    uint64_t dead_lettered;
   };
   struct Snapshot {
     uint32_t layout_version = 0;
@@ -733,6 +948,9 @@ class Topic {
     uint32_t block_size = 0;
     uint32_t queue_capacity = 0;
     uint32_t free_blocks = 0;
+    uint32_t large_block_count = 0;
+    uint32_t large_block_size = 0;
+    uint32_t large_free_blocks = 0;
     bool free_list_consistent = true;
     std::vector<SlotInfo> slots;
     std::vector<GroupInfo> groups;
@@ -752,27 +970,23 @@ class Topic {
   Topic& operator=(const Topic&) = delete;
 
   static bool destroy(const std::string& name) { return shm_unlink(name.c_str()) == 0; }
-  static constexpr size_t max_payload_size() { return kMaxPayload; }
+  // The largest payload a loan can hold, counting the large class.
+  static constexpr size_t max_payload_size() {
+    return kMaxLargePayload > kMaxPayload ? kMaxLargePayload : kMaxPayload;
+  }
   const Options& options() const { return options_; }
 
   // Reclaims slots whose owners exited: their loans, queued references,
-  // group memberships and publisher pins. Returns the number reclaimed. When
-  // it reclaims any, it also attempts recover() once, because a dead owner
-  // may have been mid-operation.
-  size_t collect_garbage() {
+  // group memberships and publisher pins, and resolves queue cells a dead
+  // endpoint left half written or half consumed, so live readers are never
+  // stuck behind them. This needs only the live writers to finish their
+  // current operation, not a quiescent topic. Returns the number of slots
+  // reclaimed. If a dead owner may have leaked a block that local repair
+  // cannot attribute (now or in an earlier reclamation that could not
+  // repair), it also attempts recover() once.
+  size_t collect_garbage(RecoveryReport* report = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t reclaimed = 0;
-    for (uint32_t i = 0; i < kSlots; ++i) {
-      if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) ==
-          detail::kSlotFree) {
-        continue;
-      }
-      if (detail::ofd_lock(fd_, i, F_WRLCK) != 0) continue;
-      if (reclaim_slot(i, nullptr)) ++reclaimed;
-      detail::ofd_lock(fd_, i, F_UNLCK);
-    }
-    if (reclaimed) recover_locked(nullptr);
-    return reclaimed;
+    return collect_locked(kReclaimWaitNs, report);
   }
 
   // Full consistency check and repair. Reclaims dead slots, then rebuilds
@@ -842,11 +1056,36 @@ class Topic {
   SlotRecord& slot(uint32_t i) { return region_->slots[i]; }
   GroupRecord& group(uint32_t g) { return region_->groups[g]; }
   detail::BlockHeader& header(uint32_t id) {
-    return *reinterpret_cast<detail::BlockHeader*>(blocks_ + static_cast<size_t>(id) * kBlockSize);
+    return *reinterpret_cast<detail::BlockHeader*>(blocks_ + block_offset(id));
   }
-  char* payload(uint32_t id) {
-    return blocks_ + static_cast<size_t>(id) * kBlockSize + sizeof(detail::BlockHeader);
+  static size_t block_offset(uint32_t id) {
+    return id < kBlockCount ? static_cast<size_t>(id) * kBlockSize
+                            : static_cast<size_t>(kBlockCount) * kBlockSize +
+                                  static_cast<size_t>(id - kBlockCount) * kLargeBlockSize;
   }
+  static size_t payload_capacity(uint32_t id) {
+    return id < kBlockCount ? kMaxPayload : kMaxLargePayload;
+  }
+  bool pop_free(size_t size, uint32_t& id) {
+    if (size <= kMaxPayload) return region_->free_list.pop(id);
+    if (!kLargeBlockCount || !region_->large_free_list.pop(id)) return false;
+    id += kBlockCount;
+    return true;
+  }
+  void push_free(uint32_t id, bool force = false) {
+    if (id < kBlockCount) {
+      if (force) {
+        region_->free_list.force_push(id);
+      } else {
+        region_->free_list.push(id);
+      }
+    } else if (force) {
+      region_->large_free_list.force_push(id - kBlockCount);
+    } else {
+      region_->large_free_list.push(id - kBlockCount);
+    }
+  }
+  char* payload(uint32_t id) { return blocks_ + block_offset(id) + sizeof(detail::BlockHeader); }
   static bool is_publisher_slot(uint32_t i) { return i < kMaxPublishers; }
 
   void open_region() {
@@ -889,9 +1128,10 @@ class Topic {
         region_->max_groups = kMaxGroups;
         region_->queue_capacity = kQueueCapacity;
         region_->free_list.init();
+        if (kLargeBlockCount) region_->large_free_list.init();
         for (uint32_t i = 0; i < kSlots; ++i) region_->slots[i].init();
         for (uint32_t g = 0; g <= kMaxGroups; ++g) region_->groups[g].init();
-        for (uint32_t id = 0; id < kBlockCount; ++id) {
+        for (uint32_t id = 0; id < kBlockIds; ++id) {
           new (&header(id)) detail::BlockHeader();
           header(id).state.store(0, std::memory_order_relaxed);
         }
@@ -928,7 +1168,62 @@ class Topic {
     }
   }
 
-  Status recover_locked(RecoveryReport* report) {
+  static constexpr uint64_t kReclaimWaitNs = 100000000;
+  // Data-path healing must not hold up the caller for long.
+  static constexpr uint64_t kHealWaitNs = 1000000;
+
+  uint64_t heal_interval_ns() const {
+    const auto us = options_.self_heal_interval.count();
+    return us > 0 ? static_cast<uint64_t>(us) * 1000 : 1;
+  }
+
+  // Rate-limited, non-blocking collect_garbage(); `full` adds recover() for
+  // leaks no dead slot accounts for. Returns false if it did not run.
+  bool heal(bool full) {
+    if (!options_.self_heal) return false;
+    const uint64_t now = detail::monotonic_ns();
+    uint64_t next = next_heal_ns_.load(std::memory_order_relaxed);
+    if (now < next) return false;
+    if (!next_heal_ns_.compare_exchange_strong(next, now + heal_interval_ns(),
+                                               std::memory_order_relaxed)) {
+      return false;
+    }
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    RecoveryReport report;
+    collect_locked(kHealWaitNs, &report);
+    if (full && !report.full_repair) recover_locked(nullptr, kHealWaitNs);
+    return true;
+  }
+
+  size_t collect_locked(uint64_t wait_ns, RecoveryReport* report) {
+    RecoveryReport rep;
+    size_t reclaimed = 0;
+    bool leak = false;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) ==
+          detail::kSlotFree) {
+        continue;
+      }
+      if (detail::ofd_lock(fd_, i, F_WRLCK) != 0) continue;
+      if (reclaim_slot(i, &rep, wait_ns, false, &leak)) ++reclaimed;
+      detail::ofd_lock(fd_, i, F_UNLCK);
+    }
+    rep.slots_reclaimed = static_cast<uint32_t>(reclaimed);
+    if ((reclaimed && leak) || region_->repair_pending.load(std::memory_order_relaxed)) {
+      RecoveryReport full;
+      rep.full_repair = true;
+      rep.full_repair_status = recover_locked(&full, wait_ns);
+      rep.orphans_freed = full.orphans_freed;
+      rep.states_repaired = full.states_repaired;
+      rep.members_cleared = full.members_cleared;
+      rep.inconsistencies = full.inconsistencies;
+    }
+    if (report) *report = rep;
+    return reclaimed;
+  }
+
+  Status recover_locked(RecoveryReport* report, uint64_t wait_ns = kReclaimWaitNs) {
     RecoveryReport rep;
     if (detail::ofd_lock(fd_, detail::kMaintenanceByte, F_WRLCK) != 0) return Status::kBusy;
     bool locked[kSlots];
@@ -939,11 +1234,12 @@ class Topic {
         live |= 1ULL << i;
       } else if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
                      detail::kSlotFree &&
-                 reclaim_slot(i, &rep)) {
+                 reclaim_slot(i, &rep, wait_ns, false, nullptr)) {
         ++rep.slots_reclaimed;
       }
     }
     const Status status = repair(live, rep);
+    if (status == Status::kOk) region_->repair_pending.store(0, std::memory_order_relaxed);
     for (uint32_t i = 0; i < kSlots; ++i) {
       if (locked[i]) detail::ofd_lock(fd_, i, F_UNLCK);
     }
@@ -1005,7 +1301,7 @@ class Topic {
       }
       if (detail::lifecycle_state(slot(i).lifecycle.load(std::memory_order_acquire)) !=
               detail::kSlotFree &&
-          !reclaim_slot(i, nullptr)) {
+          !reclaim_slot(i, nullptr, kReclaimWaitNs, false, nullptr)) {
         detail::ofd_lock(fd, i, F_UNLCK);
         contended = true;
         continue;
@@ -1030,9 +1326,15 @@ class Topic {
   void begin_activity(uint32_t i, uint64_t& counter, uint32_t op, uint32_t id) {
     ++counter;
     slot(i).activity.store((counter << 32) | (static_cast<uint64_t>(op) << 24) | (id & 0xffffff),
-                           std::memory_order_relaxed);
+                           std::memory_order_release);
     // Recovery that observes any later store of this operation also observes
     // the activity word above.
+    std::atomic_thread_fence(std::memory_order_release);
+  }
+  void mark_dropping(uint32_t i) {
+    auto& a = slot(i).activity;
+    a.store(a.load(std::memory_order_relaxed) | detail::kActivityDropping,
+            std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_release);
   }
   void end_activity(uint32_t i, uint64_t& counter) {
@@ -1044,7 +1346,7 @@ class Topic {
     const uint64_t previous = header(id).state.fetch_sub(bits, std::memory_order_acq_rel);
     if (previous == bits) {
       SHM_PUBSUB_FAULT_POINT("release.before_push");
-      region_->free_list.push(id);
+      push_free(id);
     }
   }
 
@@ -1057,7 +1359,7 @@ class Topic {
       if (header(id).state.compare_exchange_weak(state, state - bit, std::memory_order_acq_rel)) {
         if (state == bit) {
           SHM_PUBSUB_FAULT_POINT("release.before_push");
-          region_->free_list.push(id);
+          push_free(id);
         }
         return true;
       }
@@ -1101,7 +1403,8 @@ class Topic {
   void forget_loan(uint32_t i, uint32_t id) {
     auto& s = slot(i);
     for (uint32_t k = 0; k < kLoanEntries; ++k) {
-      if (s.held[k].load(std::memory_order_relaxed) == id) {
+      const uint32_t entry = s.held[k].load(std::memory_order_relaxed);
+      if (entry != detail::kNoEntry && detail::cell_block(entry) == id) {
         s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
         return;
       }
@@ -1142,30 +1445,116 @@ class Topic {
     while (q.try_claim(pos, id)) {
       q.release(pos);
       SHM_PUBSUB_FAULT_POINT("group.drain_after_release");
-      if (id < kBlockCount) release_bits(id, detail::kQueueUnit);
+      id = detail::cell_block(id);
+      if (id < kBlockIds) release_bits(id, detail::kQueueUnit);
     }
+  }
+
+  void wake_space(uint32_t g) {
+    detail::WakeWord& w = group(g).space;
+    // Pairs with the fence in deliver_blocking().
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (w.waiters.load(std::memory_order_relaxed) == 0) return;
+    w.generation.fetch_add(1, std::memory_order_release);
+    detail::futex_wake(&w.generation, INT_MAX);
+  }
+
+  // Moves slot i's hold on block id back into group g's queue, or drops it
+  // once the group's max_deliveries is reached. The queue reference is
+  // added before the holder bit goes, so a crash in between duplicates the
+  // message rather than losing it. `reclaiming` clears the bit of a dead
+  // slot idempotently.
+  Status redeliver(uint32_t g, uint32_t id, uint32_t delivered, uint32_t i, bool reclaiming) {
+    auto& rec = group(g);
+    const uint32_t max = detail::policy_max_deliveries(rec.policy.load(std::memory_order_relaxed));
+    Status status = Status::kDeadLettered;
+    if (max && delivered >= max) {
+      rec.dead_lettered.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      header(id).state.fetch_add(detail::kQueueUnit, std::memory_order_acq_rel);
+      if (!rec.queue.try_enqueue(detail::make_cell(id, delivered))) {
+        header(id).state.fetch_sub(detail::kQueueUnit, std::memory_order_acq_rel);
+        return Status::kQueueFull;
+      }
+      SHM_PUBSUB_FAULT_POINT("redeliver.after_enqueue");
+      rec.redelivered.fetch_add(1, std::memory_order_relaxed);
+      status = Status::kOk;
+    }
+    SHM_PUBSUB_FAULT_POINT("redeliver.after_convert");
+    if (reclaiming) {
+      clear_holder(id, i);
+    } else {
+      release_bits(id, 1ULL << i);
+    }
+    forget_loan(i, id);
+    return status;
+  }
+
+  bool at_least_once(uint32_t g) {
+    return detail::policy_delivery(group(g).policy.load(std::memory_order_relaxed)) ==
+           static_cast<uint32_t>(Delivery::kAtLeastOnce);
   }
 
   // The caller holds slot i's lock byte, so no owner can use the slot. The
   // steps are idempotent: a reclaimer that dies is resumed by the next one.
-  bool reclaim_slot(uint32_t i, RecoveryReport* report) {
+  // `graceful` is set when the owner itself tears down an idle endpoint.
+  // Returns false, leaving the slot RECLAIMING for a later call, when live
+  // endpoints did not finish their current operation within `wait_ns`.
+  // `leak` is set when the dead owner may have left a block that only
+  // recover() can find.
+  bool reclaim_slot(uint32_t i, RecoveryReport* report, uint64_t wait_ns, bool graceful,
+                    bool* leak) {
     auto& s = slot(i);
     uint64_t lc = s.lifecycle.load(std::memory_order_acquire);
-    for (;;) {
-      if (detail::lifecycle_state(lc) == detail::kSlotFree) return false;
-      if (detail::lifecycle_state(lc) == detail::kSlotReclaiming) break;
-      const uint64_t next = (lc & ~detail::kStateMask) | detail::kSlotReclaiming;
-      if (s.lifecycle.compare_exchange_weak(lc, next, std::memory_order_acq_rel)) break;
+    if (detail::lifecycle_state(lc) == detail::kSlotFree) return false;
+    // A reclaimer that died may have been between any two steps.
+    const bool resumed = detail::lifecycle_state(lc) == detail::kSlotReclaiming;
+    if (!resumed) {
+      s.last_activity.store(graceful ? 0 : s.activity.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+      lc = (lc & ~detail::kStateMask) | detail::kSlotReclaiming;
+      s.lifecycle.store(lc, std::memory_order_release);
     }
+    const uint64_t last = s.last_activity.load(std::memory_order_relaxed);
+    const uint32_t last_op = detail::activity_op(last);
     uint64_t counter = s.activity.load(std::memory_order_relaxed) >> 32;
     begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
     s.subscribed.store(0, std::memory_order_release);
+    // Takes leave nothing behind that queue resolution and the loan table do
+    // not cover. A release can die between dropping the last reference and
+    // pushing the block; a still-referenced block shows it got no further.
+    bool may_leak = resumed;
+    if (last_op == detail::kOpRelease) {
+      const uint32_t id = detail::activity_block(last);
+      may_leak |= id >= kBlockIds || header(id).state.load(std::memory_order_acquire) == 0;
+    } else if (last_op != detail::kOpIdle && last_op != detail::kOpTake) {
+      may_leak = true;
+    }
     if (is_publisher_slot(i)) {
       if (s.pinned.exchange(0, std::memory_order_acq_rel) && report) ++report->pins_cleared;
+      if (!graceful) {
+        Queue* queues[kMaxSubscribers + kMaxGroups];
+        size_t n = 0;
+        for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
+          if (detail::lifecycle_state(slot(j).lifecycle.load(std::memory_order_acquire)) ==
+              detail::kSlotActive) {
+            queues[n++] = &slot(j).queue;
+          }
+        }
+        for (uint32_t g = 1; g <= kMaxGroups; ++g) queues[n++] = &group(g).queue;
+        if (!resolve_queues(queues, n, wait_ns, 1ULL << i, report, may_leak)) {
+          end_activity(i, counter);
+          return false;
+        }
+        SHM_PUBSUB_FAULT_POINT("reclaim.after_resolve");
+        if (recount_in_flight(i, last, resumed, wait_ns, report)) may_leak = false;
+      }
     } else {
+      // Pairs with the fence in publish: either the publisher sees the slot
+      // leave ACTIVE, or this loop sees its pin and waits.
       std::atomic_thread_fence(std::memory_order_seq_cst);
       const uint64_t bit = member_bit(i);
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+      const uint64_t deadline = detail::monotonic_ns() + wait_ns;
       for (;;) {
         uint64_t waiting = 0;
         for (uint32_t p = 0; p < kMaxPublishers; ++p) {
@@ -1173,20 +1562,42 @@ class Topic {
         }
         // A dead publisher never touches the queue again; its mask is stale.
         if (!(waiting & live_publishers())) break;
-        if (std::chrono::steady_clock::now() > deadline) {
+        if (detail::monotonic_ns() > deadline) {
           end_activity(i, counter);
           return false;
         }
         std::this_thread::yield();
       }
       SHM_PUBSUB_FAULT_POINT("reclaim.after_pin_wait");
-      drain_dead_queue(s.queue, i);
       const uint32_t g = s.group.load(std::memory_order_relaxed);
-      if (g >= 1 && g <= kMaxGroups) leave_group(g, i);
+      const bool member = g >= 1 && g <= kMaxGroups;
+      if (member && !graceful) {
+        // Cells this member claimed must be resolved while its holder bits
+        // still show whether it converted them.
+        Queue* queues[1] = {&group(g).queue};
+        if (!resolve_queues(queues, 1, wait_ns, 1ULL << i, report, may_leak)) {
+          end_activity(i, counter);
+          return false;
+        }
+      }
+      if (!graceful && last_op == detail::kOpRequeue &&
+          recount_in_flight(i, last, resumed, wait_ns, report)) {
+        may_leak = false;
+      }
+      drain_dead_queue(s.queue, i);
+      if (member && !graceful && at_least_once(g) && !requeue_held(i, g, counter, wait_ns)) {
+        end_activity(i, counter);
+        return false;
+      }
+      if (member) {
+        begin_activity(i, counter, detail::kOpLeave, detail::kNoBlock);
+        leave_group(g, i);
+        begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
+      }
     }
     for (uint32_t k = 0; k < kLoanEntries; ++k) {
-      const uint32_t id = s.held[k].load(std::memory_order_relaxed);
-      if (id < kBlockCount) clear_holder(id, i);
+      const uint32_t id = detail::cell_block(s.held[k].load(std::memory_order_relaxed));
+      if (id < kBlockIds) clear_holder(id, i);
       s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
     }
     s.queue.init();
@@ -1194,7 +1605,320 @@ class Topic {
     end_activity(i, counter);
     s.lifecycle.store(detail::make_lifecycle(detail::lifecycle_generation(lc), detail::kSlotFree),
                       std::memory_order_release);
+    if (may_leak) {
+      region_->repair_pending.store(1, std::memory_order_relaxed);
+      if (leak) *leak = true;
+    }
     return true;
+  }
+
+  // The block a dead publisher (or requeuing member) was delivering may
+  // carry a queue reference that never reached a queue.
+  bool recount_in_flight(uint32_t i, uint64_t last, bool resumed, uint64_t wait_ns,
+                         RecoveryReport* report) {
+    const uint32_t op = detail::activity_op(last);
+    const uint32_t id = detail::activity_block(last);
+    if ((op != detail::kOpPublish && op != detail::kOpRequeue) || resumed ||
+        (last & detail::kActivityDropping) || id >= kBlockIds ||
+        !recount_block(id, wait_ns, 1ULL << i)) {
+      return false;
+    }
+    if (report) ++report->blocks_recounted;
+    return true;
+  }
+
+  // A dead member of an at-least-once group hands its loans back to the
+  // group. Runs as a requeue operation so that local repair elsewhere waits
+  // for it. Fails, to be retried later, while the group queue stays full.
+  bool requeue_held(uint32_t i, uint32_t g, uint64_t& counter, uint64_t wait_ns) {
+    auto& s = slot(i);
+    const uint64_t deadline = detail::monotonic_ns() + wait_ns;
+    bool requeued = false;
+    for (uint32_t k = 0; k < kLoanEntries; ++k) {
+      const uint32_t entry = s.held[k].load(std::memory_order_relaxed);
+      if (entry == detail::kNoEntry) continue;
+      const uint32_t id = detail::cell_block(entry);
+      if (id >= kBlockIds || !(header(id).state.load(std::memory_order_acquire) & (1ULL << i))) {
+        s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
+        continue;
+      }
+      begin_activity(i, counter, detail::kOpRequeue, id);
+      for (;;) {
+        const Status status = redeliver(g, id, detail::cell_attempt(entry) + 1, i, true);
+        if (status != Status::kQueueFull) {
+          requeued |= status == Status::kOk;
+          break;
+        }
+        if (detail::monotonic_ns() > deadline) {
+          begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
+          return false;
+        }
+        std::this_thread::yield();
+      }
+      begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
+    }
+    if (requeued) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      Publisher::wake(group(g).queue.wake, INT_MAX);
+    }
+    return true;
+  }
+
+  // Slots whose lock byte another description holds: live owners, and
+  // reclaimers working on a slot. `self` is the slot being reclaimed, which
+  // a constructor reclaims through its own description.
+  uint64_t held_elsewhere(uint64_t self) const {
+    uint64_t live = 0;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (detail::ofd_held_elsewhere(fd_, i)) live |= 1ULL << i;
+    }
+    return live & ~self;
+  }
+
+  // Waits until every live slot that was inside an operation has moved on,
+  // so anything such a writer had half done before the call is complete.
+  // Reclaimers in their passive phase (kOpReclaim) touch no shared queue.
+  bool wait_for_writers(uint64_t wait_ns, uint64_t self) {
+    uint64_t seen[kSlots] = {};
+    uint64_t pending = 0;
+    const uint64_t live = held_elsewhere(self);
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if (!(live & (1ULL << i))) continue;
+      const uint64_t a = slot(i).activity.load(std::memory_order_acquire);
+      const uint32_t op = detail::activity_op(a);
+      if (op != detail::kOpIdle && op != detail::kOpReclaim) {
+        seen[i] = a;
+        pending |= 1ULL << i;
+      }
+    }
+    const uint64_t deadline = detail::monotonic_ns() + wait_ns;
+    while (pending) {
+      for (uint64_t p = pending; p; p &= p - 1) {
+        const uint32_t i = static_cast<uint32_t>(__builtin_ctzll(p));
+        if (slot(i).activity.load(std::memory_order_acquire) != seen[i]) pending &= ~(1ULL << i);
+      }
+      if (!pending) break;
+      if (detail::monotonic_ns() > deadline) return false;
+      std::this_thread::yield();
+    }
+    return true;
+  }
+
+  struct StuckCell {
+    Queue* queue;
+    uint64_t pos;
+    uint32_t group;  // 0 for a private queue
+    bool hole;
+  };
+
+  // Holes are reserved, uncommitted cells; claimed cells were dequeued but
+  // not released. Either kind stops the queue once it reaches it.
+  void find_stuck(Queue& q, std::vector<StuckCell>& out) {
+    uint32_t g = 0;
+    for (uint32_t k = 1; k <= kMaxGroups; ++k) {
+      if (&q == &group(k).queue) g = k;
+    }
+    const uint64_t d = q.dequeue_pos.load(std::memory_order_acquire);
+    const uint64_t e = q.enqueue_pos.load(std::memory_order_acquire);
+    if (e < d || e - d > kQueueCapacity) return;
+    for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < d; ++pos) {
+      if (q.cell(pos).sequence.load(std::memory_order_acquire) == pos + 1) {
+        StuckCell c = {&q, pos, g, false};
+        out.push_back(c);
+      }
+    }
+    for (uint64_t pos = d; pos < e; ++pos) {
+      if (q.cell(pos).sequence.load(std::memory_order_acquire) == pos) {
+        StuckCell c = {&q, pos, g, true};
+        out.push_back(c);
+      }
+    }
+  }
+
+  // Observes stuck cells first and live writers second. Whoever reserved or
+  // claimed an observed cell did so inside an operation that the second
+  // observation sees (enqueue_pos and dequeue_pos are advanced after the
+  // operation is journaled). Once every such operation has ended, a cell
+  // that is still stuck belongs to a dead endpoint. Holes become
+  // tombstones. A claimed cell is released, and its queue reference is
+  // dropped unless an untrusted holder bit on the block leaves open whether
+  // the claimer already converted it; that case leaks rather than risking a
+  // double release.
+  bool resolve_queues(Queue* const* queues, size_t n, uint64_t wait_ns, uint64_t self,
+                      RecoveryReport* report, bool& leak) {
+    std::vector<StuckCell> stuck;
+    for (size_t k = 0; k < n; ++k) find_stuck(*queues[k], stuck);
+    if (stuck.empty()) return true;
+    if (!wait_for_writers(wait_ns, self)) return false;
+    const uint64_t live = held_elsewhere(self);
+    uint64_t trusted = 0;
+    for (uint32_t i = 0; i < kSlots; ++i) {
+      if ((live & (1ULL << i)) && detail::lifecycle_state(slot(i).lifecycle.load(
+                                      std::memory_order_acquire)) == detail::kSlotActive) {
+        trusted |= 1ULL << i;
+      }
+    }
+    for (size_t k = 0; k < stuck.size(); ++k) {
+      auto& c = stuck[k].queue->cell(stuck[k].pos);
+      const uint64_t pos = stuck[k].pos;
+      if (stuck[k].hole) {
+        if (c.sequence.load(std::memory_order_acquire) != pos) continue;
+        SHM_PUBSUB_FAULT_POINT("repair.before_tombstone");
+        c.value.store(detail::kTombstone, std::memory_order_relaxed);
+        uint64_t expected = pos;
+        if (c.sequence.compare_exchange_strong(expected, pos + 1, std::memory_order_acq_rel)) {
+          // The reference the dead publisher added for this cell is
+          // dropped by the recount in that publisher's own reclamation.
+          if (report) ++report->holes_filled;
+        }
+        continue;
+      }
+      uint64_t expected = pos + 1;
+      if (c.sequence.load(std::memory_order_acquire) != expected) continue;
+      const uint32_t cell = c.value.load(std::memory_order_relaxed);
+      const uint32_t id = cell == detail::kTombstone ? cell : detail::cell_block(cell);
+      const uint64_t untrusted = id < kBlockIds ? header(id).state.load(std::memory_order_acquire) &
+                                                      detail::kHolderMask & ~trusted
+                                                : 0;
+      const bool keep = untrusted != 0;
+      if (!keep && id < kBlockIds && stuck[k].group && at_least_once(stuck[k].group)) {
+        // The claimer died before converting: deliver the message again.
+        // A crash before the release below redelivers it once more, which
+        // at-least-once allows.
+        redeliver_claimed(stuck[k].group, id, detail::cell_attempt(cell) + 1);
+      }
+      SHM_PUBSUB_FAULT_POINT("repair.before_cell_release");
+      if (!c.sequence.compare_exchange_strong(expected, pos + kQueueCapacity,
+                                              std::memory_order_acq_rel)) {
+        continue;
+      }
+      if (report) ++report->cells_released;
+      if (id >= kBlockIds) continue;
+      if (keep) {
+        // Exact when only dead members of this group hold the block and it
+        // occurs nowhere else in the queue: such a bit can only come from
+        // converting this very cell.
+        if ((untrusted & ~dead_members(stuck[k].group, live)) ||
+            occurs_elsewhere(*stuck[k].queue, pos, id)) {
+          leak = true;
+        }
+      } else {
+        release_bits(id, detail::kQueueUnit);
+      }
+    }
+    return true;
+  }
+
+  // Adds a reference for a second copy of a claimed cell's message; the
+  // caller then drops the claimed cell's own reference.
+  void redeliver_claimed(uint32_t g, uint32_t id, uint32_t delivered) {
+    auto& rec = group(g);
+    const uint32_t max = detail::policy_max_deliveries(rec.policy.load(std::memory_order_relaxed));
+    if (max && delivered >= max) {
+      rec.dead_lettered.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    header(id).state.fetch_add(detail::kQueueUnit, std::memory_order_acq_rel);
+    if (rec.queue.try_enqueue(detail::make_cell(id, delivered))) {
+      rec.redelivered.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      header(id).state.fetch_sub(detail::kQueueUnit, std::memory_order_acq_rel);
+      rec.dropped_newest.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  uint64_t dead_members(uint32_t g, uint64_t live) const {
+    uint64_t mask = 0;
+    if (g == 0) return 0;
+    for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
+      if (!(live & (1ULL << j)) && region_->slots[j].group.load(std::memory_order_relaxed) == g) {
+        mask |= 1ULL << j;
+      }
+    }
+    return mask;
+  }
+
+  static bool occurs_elsewhere(Queue& q, uint64_t skip, uint32_t id) {
+    const uint64_t d = q.dequeue_pos.load(std::memory_order_acquire);
+    const uint64_t e = q.enqueue_pos.load(std::memory_order_acquire);
+    for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < e; ++pos) {
+      if (pos == skip) continue;
+      const auto& c = q.cell(pos);
+      const uint64_t seq = c.sequence.load(std::memory_order_acquire);
+      if ((seq == pos + 1 || seq == pos) &&
+          detail::cell_block(c.value.load(std::memory_order_relaxed)) == id) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Counts committed cells holding block id. Fails while the block may be
+  // in transit: claimed but not released, being drained, or behind a hole
+  // whose value is not written yet.
+  bool count_refs(Queue& q, uint32_t id, uint32_t& refs) {
+    const uint64_t d = q.dequeue_pos.load(std::memory_order_acquire);
+    const uint64_t e = q.enqueue_pos.load(std::memory_order_acquire);
+    if (e < d || e - d > kQueueCapacity) return false;
+    for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < d; ++pos) {
+      const auto& c = q.cell(pos);
+      if (c.sequence.load(std::memory_order_acquire) == pos + 1 &&
+          detail::cell_block(c.value.load(std::memory_order_relaxed)) == id) {
+        return false;
+      }
+    }
+    for (uint64_t pos = d; pos < e; ++pos) {
+      const auto& c = q.cell(pos);
+      const uint64_t seq = c.sequence.load(std::memory_order_acquire);
+      if (seq == pos) return false;
+      if (detail::cell_block(c.value.load(std::memory_order_relaxed)) != id) continue;
+      if (seq == pos + 1) {
+        ++refs;
+      } else if (seq == pos + kQueueCapacity) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Re-derives the queue references of a block whose publisher died while
+  // delivering it, which drops a reference the publisher added but never
+  // placed in a queue. A concurrent conversion changes the state word and
+  // fails the CAS, so the count and the CAS agree. Refuses while a live
+  // endpoint holds the block, since a holder can requeue it.
+  bool recount_block(uint32_t id, uint64_t wait_ns, uint64_t self) {
+    const uint64_t deadline = detail::monotonic_ns() + wait_ns;
+    for (;;) {
+      const uint64_t live = held_elsewhere(self);
+      const uint64_t observed = header(id).state.load(std::memory_order_acquire);
+      // Zero means released, perhaps not yet pushed: only recover() can tell.
+      if (observed == 0) return false;
+      bool settled = (observed & detail::kHolderMask & live) == 0;
+      uint32_t refs = 0;
+      for (uint32_t j = kMaxPublishers; settled && j < kSlots; ++j) {
+        if (detail::lifecycle_state(slot(j).lifecycle.load(std::memory_order_acquire)) !=
+            detail::kSlotFree) {
+          settled = count_refs(slot(j).queue, id, refs);
+        }
+      }
+      for (uint32_t g = 1; settled && g <= kMaxGroups; ++g) {
+        settled = count_refs(group(g).queue, id, refs);
+      }
+      if (settled) {
+        const uint64_t computed = (observed & detail::kHolderMask) |
+                                  (static_cast<uint64_t>(refs) << detail::kMaxHolderBits);
+        if (computed == observed) return true;
+        uint64_t expected = observed;
+        SHM_PUBSUB_FAULT_POINT("recount.before_cas");
+        if (header(id).state.compare_exchange_strong(expected, computed,
+                                                     std::memory_order_acq_rel)) {
+          if (computed == 0) push_free(id);
+          return true;
+        }
+      }
+      if (detail::monotonic_ns() > deadline) return false;
+      std::this_thread::yield();
+    }
   }
 
   // No publisher is pinned on this queue and its consumer is gone, so the
@@ -1207,7 +1931,8 @@ class Topic {
       auto& c = q.cell(pos);
       uint64_t seq = c.sequence.load(std::memory_order_acquire);
       if (seq != pos + 1) continue;
-      const uint32_t id = c.value.load(std::memory_order_relaxed);
+      const uint32_t raw = c.value.load(std::memory_order_relaxed);
+      const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
       if (!c.sequence.compare_exchange_strong(seq, pos + kQueueCapacity,
                                               std::memory_order_acq_rel)) {
         continue;
@@ -1216,8 +1941,7 @@ class Topic {
       // Claimed but never released: either the owner died before converting
       // the reference into its holder bit, or a dropping publisher died
       // before releasing the cell (it drops the reference afterwards).
-      if (id < kBlockCount &&
-          !(header(id).state.load(std::memory_order_acquire) & (1ULL << owner))) {
+      if (id < kBlockIds && !(header(id).state.load(std::memory_order_acquire) & (1ULL << owner))) {
         release_bits(id, detail::kQueueUnit);
       }
     }
@@ -1225,13 +1949,14 @@ class Topic {
       auto& c = q.cell(pos);
       uint64_t seq = c.sequence.load(std::memory_order_acquire);
       if (seq != pos + 1) continue;
-      const uint32_t id = c.value.load(std::memory_order_relaxed);
+      const uint32_t raw = c.value.load(std::memory_order_relaxed);
+      const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
       if (!c.sequence.compare_exchange_strong(seq, pos + kQueueCapacity,
                                               std::memory_order_acq_rel)) {
         continue;
       }
       SHM_PUBSUB_FAULT_POINT("reclaim.after_mark");
-      if (id < kBlockCount) release_bits(id, detail::kQueueUnit);
+      if (id < kBlockIds) release_bits(id, detail::kQueueUnit);
     }
   }
 
@@ -1258,8 +1983,9 @@ class Topic {
     for (uint64_t pos = d; pos < e; ++pos) {
       const uint64_t seq = q.cell(pos).sequence.load(std::memory_order_acquire);
       if (seq == pos + 1) {
-        const uint32_t id = q.cell(pos).value.load(std::memory_order_relaxed);
-        if (id < kBlockCount) {
+        const uint32_t raw = q.cell(pos).value.load(std::memory_order_relaxed);
+        const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
+        if (id < kBlockIds) {
           ++refs[id];
         } else if (id != detail::kTombstone) {
           ++rep.inconsistencies;
@@ -1278,16 +2004,22 @@ class Topic {
       activity[i] = slot(i).activity.fetch_add(0, std::memory_order_acq_rel);
       if (detail::activity_op(activity[i]) != detail::kOpIdle) return Status::kBusy;
     }
-    std::vector<uint64_t> states(kBlockCount);
-    std::vector<uint32_t> refs(kBlockCount, 0);
-    std::vector<char> in_free(kBlockCount, 0);
+    std::vector<uint64_t> states(kBlockIds);
+    std::vector<uint32_t> refs(kBlockIds, 0);
+    std::vector<char> in_free(kBlockIds, 0);
     std::vector<CellFix> fixes;
     bool list_ok = region_->free_list.for_each_free([&](uint32_t id) {
       if (in_free[id]) ++rep.inconsistencies;
       in_free[id] = 1;
     });
+    if (kLargeBlockCount) {
+      list_ok &= region_->large_free_list.for_each_free([&](uint32_t local) {
+        if (in_free[kBlockCount + local]) ++rep.inconsistencies;
+        in_free[kBlockCount + local] = 1;
+      });
+    }
     if (!list_ok) ++rep.inconsistencies;
-    for (uint32_t id = 0; id < kBlockCount; ++id) {
+    for (uint32_t id = 0; id < kBlockIds; ++id) {
       states[id] = header(id).state.load(std::memory_order_acquire);
     }
     for (uint32_t j = kMaxPublishers; j < kSlots; ++j) {
@@ -1332,7 +2064,7 @@ class Topic {
       }
     }
     const uint64_t holders = live & detail::kHolderMask;
-    for (uint32_t id = 0; id < kBlockCount; ++id) {
+    for (uint32_t id = 0; id < kBlockIds; ++id) {
       const uint64_t observed = states[id];
       const uint64_t computed =
           (observed & holders) | (static_cast<uint64_t>(refs[id]) << detail::kMaxHolderBits);
@@ -1347,7 +2079,7 @@ class Topic {
         continue;
       }
       if (computed == 0) {
-        region_->free_list.force_push(id);
+        push_free(id, true);
         ++rep.orphans_freed;
       } else {
         ++rep.states_repaired;
@@ -1366,6 +2098,14 @@ class Topic {
     uint32_t free_blocks = 0;
     snap.free_list_consistent = region.free_list.for_each_free([&](uint32_t) { ++free_blocks; });
     snap.free_blocks = free_blocks;
+    snap.large_block_count = kLargeBlockCount;
+    snap.large_block_size = kLargeBlockSize;
+    if (kLargeBlockCount) {
+      uint32_t large_free = 0;
+      snap.free_list_consistent &=
+          region.large_free_list.for_each_free([&](uint32_t) { ++large_free; });
+      snap.large_free_blocks = large_free;
+    }
     (void)blocks;
     for (uint32_t i = 0; i < kSlots; ++i) {
       const auto& s = region.slots[i];
@@ -1400,15 +2140,21 @@ class Topic {
       const uint32_t policy = rec.policy.load(std::memory_order_relaxed);
       info.policy_set = (policy & detail::kPolicySet) != 0;
       info.overflow = static_cast<Overflow>(detail::policy_overflow(policy));
+      info.durable = detail::policy_durable(policy);
+      info.delivery = static_cast<Delivery>(detail::policy_delivery(policy));
+      info.max_deliveries = detail::policy_max_deliveries(policy);
       info.queue_depth = rec.queue.size_approx();
       info.dropped_newest = rec.dropped_newest.load(std::memory_order_relaxed);
       info.dropped_oldest = rec.dropped_oldest.load(std::memory_order_relaxed);
+      info.redelivered = rec.redelivered.load(std::memory_order_relaxed);
+      info.dead_lettered = rec.dead_lettered.load(std::memory_order_relaxed);
       snap.groups.push_back(info);
     }
     return snap;
   }
 
   Options options_;
+  std::atomic<uint64_t> next_heal_ns_{0};
   int fd_ = -1;
   Region* region_ = nullptr;
   char* blocks_ = nullptr;
@@ -1437,6 +2183,14 @@ template <class C>
 constexpr uint32_t Topic<C>::kSlots;
 template <class C>
 constexpr size_t Topic<C>::kMaxPayload;
+template <class C>
+constexpr uint32_t Topic<C>::kLargeBlockCount;
+template <class C>
+constexpr uint32_t Topic<C>::kLargeBlockSize;
+template <class C>
+constexpr uint32_t Topic<C>::kBlockIds;
+template <class C>
+constexpr size_t Topic<C>::kMaxLargePayload;
 template <class C>
 constexpr uint64_t Topic<C>::kRequiredBlocks;
 

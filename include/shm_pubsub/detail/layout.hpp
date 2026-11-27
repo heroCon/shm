@@ -49,10 +49,33 @@ inline uint64_t queue_refs(uint64_t state) { return state >> kMaxHolderBits; }
 
 // Slot activity word, used both as a journal for diagnostics and as a seqlock
 // for recovery: counter (bits 32-63), operation (bits 24-31), block (0-23).
-enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim, kOpLeave };
+enum Op : uint32_t {
+  kOpIdle = 0,
+  kOpLoan,
+  kOpPublish,
+  kOpTake,
+  kOpRelease,
+  kOpReclaim,
+  kOpLeave,
+  kOpRequeue,
+};
 constexpr uint32_t kNoBlock = 0xffffff;
 constexpr uint32_t kNoEntry = 0xffffffffu;
-inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0xff; }
+
+// Queue cells and loan-table entries hold a block id in the low 24 bits and,
+// in group queues, how often the message was delivered before in the top 8.
+constexpr uint32_t kCellBlockMask = 0xffffff;
+constexpr uint32_t kMaxDeliveryCount = 254;
+inline uint32_t cell_block(uint32_t v) { return v & kCellBlockMask; }
+inline uint32_t cell_attempt(uint32_t v) { return v >> 24; }
+inline uint32_t make_cell(uint32_t id, uint32_t attempt) {
+  return id | ((attempt < kMaxDeliveryCount ? attempt : kMaxDeliveryCount) << 24);
+}
+// Set on a publish that started dropping the oldest entries of a full
+// queue: a death in that phase can leak a block that is not the one being
+// published.
+constexpr uint64_t kActivityDropping = 1ULL << 31;
+inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0x7f; }
 inline uint32_t activity_block(uint64_t v) { return static_cast<uint32_t>(v) & 0xffffff; }
 
 // Byte offsets of OFD locks: one byte per slot plus a maintenance byte.
@@ -98,6 +121,8 @@ struct alignas(64) Slot {
   alignas(64) std::atomic<uint64_t> activity;
   std::atomic<uint64_t> next_sequence;
   std::atomic<uint64_t> pinned;  // publisher slots: subscriber slots being delivered to
+  // The dead owner's activity word, saved before reclamation overwrites it.
+  std::atomic<uint64_t> last_activity;
   std::atomic<uint32_t> held[kLoanEntries];
   SlotStats stats;
   MpmcQueue<kQueueCapacity> queue;
@@ -107,6 +132,7 @@ struct alignas(64) Slot {
     activity.store(0, std::memory_order_relaxed);
     next_sequence.store(0, std::memory_order_relaxed);
     pinned.store(0, std::memory_order_relaxed);
+    last_activity.store(0, std::memory_order_relaxed);
     for (uint32_t k = 0; k < kLoanEntries; ++k) held[k].store(kNoEntry, std::memory_order_relaxed);
     pid.store(0, std::memory_order_relaxed);
     group.store(0, std::memory_order_relaxed);
@@ -139,6 +165,9 @@ struct alignas(64) GroupRecord {
   std::atomic<uint32_t> policy;
   std::atomic<uint64_t> dropped_newest;
   std::atomic<uint64_t> dropped_oldest;
+  std::atomic<uint64_t> redelivered;
+  std::atomic<uint64_t> dead_lettered;
+  WakeWord space;  // kBlock publishers waiting for a free cell
   MpmcQueue<kQueueCapacity> queue;
 
   void init() {
@@ -146,6 +175,9 @@ struct alignas(64) GroupRecord {
     policy.store(0, std::memory_order_relaxed);
     dropped_newest.store(0, std::memory_order_relaxed);
     dropped_oldest.store(0, std::memory_order_relaxed);
+    redelivered.store(0, std::memory_order_relaxed);
+    dead_lettered.store(0, std::memory_order_relaxed);
+    space.init();
     queue.init();
   }
 };
@@ -173,7 +205,13 @@ struct Region {
   uint32_t max_subscribers;
   uint32_t max_groups;
   uint32_t queue_capacity;
+  // Set when a reclamation could not rule out a leaked block; the next
+  // collect_garbage() or exhausted loan runs recover() and clears it.
+  std::atomic<uint32_t> repair_pending;
   alignas(64) LockFreeFreeList<uint32_t, Config::kBlockCount> free_list;
+  // Large class; unused (and never initialized) when kLargeBlockCount is 0.
+  alignas(64) LockFreeFreeList<uint32_t, (Config::kLargeBlockCount > 0 ? Config::kLargeBlockCount
+                                                                       : 1)> large_free_list;
   Slot<Config::kQueueCapacity, loan_entries<Config>()>
       slots[Config::kMaxPublishers + Config::kMaxSubscribers];
   GroupRecord<Config::kQueueCapacity> groups[Config::kMaxGroups + 1];
@@ -193,6 +231,8 @@ uint64_t config_hash() {
   h = fnv_mix(h, kLayoutVersion);
   h = fnv_mix(h, Config::kBlockCount);
   h = fnv_mix(h, Config::kBlockSize);
+  h = fnv_mix(h, Config::kLargeBlockCount);
+  h = fnv_mix(h, Config::kLargeBlockSize);
   h = fnv_mix(h, Config::kQueueCapacity);
   h = fnv_mix(h, Config::kMaxPublishers);
   h = fnv_mix(h, Config::kMaxSubscribers);
@@ -214,7 +254,8 @@ constexpr size_t blocks_offset() {
 
 template <class Config>
 constexpr size_t region_size() {
-  return blocks_offset<Config>() + static_cast<size_t>(Config::kBlockCount) * Config::kBlockSize;
+  return blocks_offset<Config>() + static_cast<size_t>(Config::kBlockCount) * Config::kBlockSize +
+         static_cast<size_t>(Config::kLargeBlockCount) * Config::kLargeBlockSize;
 }
 
 }  // namespace detail
