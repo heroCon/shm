@@ -1272,7 +1272,7 @@ class Topic {
   }
 
   Status repair(uint64_t live, RecoveryReport& rep) {
-    uint64_t activity[kSlots];
+    uint64_t activity[kSlots] = {};
     for (uint32_t i = 0; i < kSlots; ++i) {
       if (!(live & (1ULL << i))) continue;
       activity[i] = slot(i).activity.fetch_add(0, std::memory_order_acq_rel);
