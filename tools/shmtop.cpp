@@ -61,13 +61,20 @@ static void print(const std::string& name, const Topic::Snapshot& snap) {
     if (!g.members && !g.queue_depth && !g.dropped_newest && !g.dropped_oldest) continue;
     const char* policy = !g.policy_set                                     ? "unset"
                          : g.overflow == shm_pubsub::Overflow::kDropOldest ? "drop_oldest"
+                         : g.overflow == shm_pubsub::Overflow::kBlock      ? "block"
                                                                            : "drop_newest";
+    const char* delivery =
+        g.delivery == shm_pubsub::Delivery::kAtLeastOnce ? "at_least_once" : "at_most_once";
     std::printf(
-        "group %u: members=%u mask=%#llx policy=%s queue=%llu drop_new=%llu drop_old=%llu\n", g.id,
-        g.members, static_cast<unsigned long long>(g.member_mask), policy,
+        "group %u: members=%u mask=%#llx policy=%s%s %s max=%u queue=%llu drop_new=%llu "
+        "drop_old=%llu redelivered=%llu dead_lettered=%llu\n",
+        g.id, g.members, static_cast<unsigned long long>(g.member_mask), policy,
+        g.durable ? ",durable" : "", delivery, g.max_deliveries,
         static_cast<unsigned long long>(g.queue_depth),
         static_cast<unsigned long long>(g.dropped_newest),
-        static_cast<unsigned long long>(g.dropped_oldest));
+        static_cast<unsigned long long>(g.dropped_oldest),
+        static_cast<unsigned long long>(g.redelivered),
+        static_cast<unsigned long long>(g.dead_lettered));
   }
 }
 

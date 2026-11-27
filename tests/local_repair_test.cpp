@@ -100,6 +100,11 @@ void check_repair(const char* label, Topic& topic, Shared* g, pid_t* readers, in
   CHECK(got >= 200);
   g->stop.store(1);
   for (int k = 0; k < n; ++k) waitpid(readers[k], nullptr, 0);
+  // The readers exit without unsubscribing; reclaiming them must not need
+  // a full repair either.
+  shm_pubsub::RecoveryReport exit_report;
+  topic.collect_garbage(&exit_report);
+  CHECK(!exit_report.full_repair);
   CHECK(free_blocks(topic) == Topic::kBlockCount);
   shm_pubsub::RecoveryReport leftover;
   CHECK(topic.recover(&leftover) == Status::kOk);
@@ -249,6 +254,7 @@ void self_heal_stalled_reader(bool blocking) {
   CHECK(g->received.load() - before >= 200);
   g->stop.store(1);
   waitpid(reader, nullptr, 0);
+  topic.collect_garbage();
   CHECK(free_blocks(topic) == Topic::kBlockCount);
   std::printf("self-heal, %-17s received=%ld\n", blocking ? "wait_take reader" : "busy reader",
               g->received.load() - before);

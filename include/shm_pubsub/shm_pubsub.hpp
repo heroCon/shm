@@ -58,11 +58,17 @@ struct Options {
   // interval per process and only if no other thread is collecting.
   bool self_heal = true;
   std::chrono::microseconds self_heal_interval{10000};
+  // How long a publish waits for room in a full kBlock group queue.
+  std::chrono::milliseconds block_timeout{1000};
 };
 
 struct SubscriberOptions {
   uint32_t group = 0;  // 0: private queue (broadcast); 1..kMaxGroups: competing group
   Overflow overflow = Overflow::kDropNewest;
+  // Group policy, fixed by the first member; later members must match.
+  bool durable = false;  // keep the backlog when the last member leaves
+  Delivery delivery = Delivery::kAtMostOnce;
+  uint32_t max_deliveries = 0;  // 0: unlimited; otherwise at most 254
 };
 
 struct RecoveryReport {
@@ -164,7 +170,8 @@ class Topic {
    public:
     ReadLoan() {}
     ~ReadLoan() { reset(); }
-    ReadLoan(ReadLoan&& other) noexcept : owner_(other.owner_), id_(other.id_) {
+    ReadLoan(ReadLoan&& other) noexcept
+        : owner_(other.owner_), id_(other.id_), delivery_(other.delivery_) {
       other.owner_ = nullptr;
     }
     ReadLoan& operator=(ReadLoan&& other) noexcept {
@@ -172,6 +179,7 @@ class Topic {
         reset();
         owner_ = other.owner_;
         id_ = other.id_;
+        delivery_ = other.delivery_;
         other.owner_ = nullptr;
       }
       return *this;
@@ -187,15 +195,29 @@ class Topic {
     // CLOCK_MONOTONIC time at publication.
     uint64_t timestamp_ns() const { return owner_ ? owner_->topic_->header(id_).timestamp_ns : 0; }
     uint32_t publisher_id() const { return owner_ ? owner_->topic_->header(id_).publisher : 0; }
+    // 1 on the first delivery; higher when a group redelivered the message
+    // after a member requeued it or died holding it.
+    uint32_t delivery_count() const { return owner_ ? delivery_ : 0; }
     void reset() {
       if (owner_) owner_->release_loan(id_);
       owner_ = nullptr;
+    }
+    // Group members only: hands the message back to the group queue for
+    // another delivery and consumes the loan. kDeadLettered: the group's
+    // max_deliveries was reached, so the message was dropped (and the loan
+    // consumed). kQueueFull: nothing changed; the loan is kept.
+    Status requeue() {
+      if (!owner_) return Status::kInvalidArgument;
+      const Status status = owner_->requeue_loan(id_, delivery_);
+      if (status == Status::kOk || status == Status::kDeadLettered) owner_ = nullptr;
+      return status;
     }
 
    private:
     friend class Topic;
     Subscriber* owner_ = nullptr;
     uint32_t id_ = 0;
+    uint32_t delivery_ = 0;
   };
 
   // A publisher endpoint. Not thread-safe: use one per thread.
@@ -341,6 +363,11 @@ class Topic {
       }
       uint64_t woken = 0;
       uint32_t group_wakes[kMaxGroups + 1] = {};
+      // Per kBlock group, the first message that found its queue full; it
+      // and every later message wait for room after this pass, in order.
+      size_t blocked_from[kMaxGroups + 1];
+      for (uint32_t g = 0; g <= kMaxGroups; ++g) blocked_from[g] = count;
+      bool any_blocked = false;
       for (size_t k = 0; k < count; ++k) {
         const uint32_t id = ids[k];
         begin(detail::kOpPublish, id);
@@ -357,6 +384,7 @@ class Topic {
         }
         for (uint32_t g = 1; g <= kMaxGroups; ++g) {
           auto& group = topic_->group(g);
+          if (blocked_from[g] < k) continue;
           if (group.member_mask.load(std::memory_order_acquire) == 0) continue;
           ++r.targets;
           const Overflow overflow = static_cast<Overflow>(
@@ -364,10 +392,14 @@ class Topic {
           if (deliver(group.queue, id, overflow, group.dropped_newest, group.dropped_oldest, r)) {
             ++r.delivered;
             ++group_wakes[g];
+          } else if (overflow == Overflow::kBlock) {
+            blocked_from[g] = k;
+            any_blocked = true;
           }
         }
         SHM_PUBSUB_FAULT_POINT("publish.before_release");
-        drop_own(id);
+        // A message still owed to a blocked group stays loaned until then.
+        if (!any_blocked) drop_own(id);
         end();
       }
       if (targets) slot.pinned.store(0, std::memory_order_release);
@@ -383,6 +415,7 @@ class Topic {
       for (uint32_t g = 1; g <= kMaxGroups; ++g) {
         if (group_wakes[g]) wake(topic_->group(g).queue.wake, static_cast<int>(group_wakes[g]));
       }
+      if (any_blocked) publish_blocked(ids, count, blocked_from, r);
       slot.stats.published.store(slot.stats.published.load(std::memory_order_relaxed) + count,
                                  std::memory_order_relaxed);
       // A queue that stays full may be stuck behind a dead endpoint's cell.
@@ -395,6 +428,68 @@ class Topic {
         r.status = Status::kPartial;
       }
       return r;
+    }
+
+    // Runs outside any operation and without pins, so a sleeping publisher
+    // holds up neither repair nor reclamation; only its loans stay held.
+    void publish_blocked(const uint32_t* ids, size_t count, const size_t* blocked_from,
+                         PublishResult& r) {
+      const uint64_t deadline =
+          detail::monotonic_ns() +
+          static_cast<uint64_t>(topic_->options_.block_timeout.count()) * 1000000ULL;
+      bool gave_up[kMaxGroups + 1] = {};
+      size_t first = count;
+      for (uint32_t g = 1; g <= kMaxGroups; ++g) first = std::min(first, blocked_from[g]);
+      for (size_t k = first; k < count; ++k) {
+        const uint32_t id = ids[k];
+        for (uint32_t g = 1; g <= kMaxGroups; ++g) {
+          if (blocked_from[g] > k) continue;
+          auto& group = topic_->group(g);
+          if (blocked_from[g] < k) ++r.targets;
+          if (!gave_up[g] && deliver_blocking(group, id, deadline)) {
+            ++r.delivered;
+          } else {
+            gave_up[g] = true;
+            group.dropped_newest.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        begin(detail::kOpRelease, id);
+        drop_own(id);
+        end();
+      }
+    }
+
+    bool deliver_blocking(detail::GroupRecord<kQueueCapacity>& group, uint32_t id,
+                          uint64_t deadline) {
+      detail::WakeWord& w = group.space;
+      PublishResult ignored = {Status::kOk, 0, 0, 0};
+      for (;;) {
+        w.waiters.fetch_add(1, std::memory_order_seq_cst);
+        // Pairs with the fence in wake_space(): either this
+        // attempt sees the freed cell, or the consumer sees the waiter.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const uint32_t generation = w.generation.load(std::memory_order_acquire);
+        begin(detail::kOpPublish, id);
+        const bool ok = group.member_mask.load(std::memory_order_acquire) != 0 &&
+                        deliver(group.queue, id, Overflow::kBlock, group.dropped_newest,
+                                group.dropped_oldest, ignored);
+        end();
+        const uint64_t now = detail::monotonic_ns();
+        if (ok || now >= deadline || group.member_mask.load(std::memory_order_acquire) == 0) {
+          w.waiters.fetch_sub(1, std::memory_order_release);
+          if (ok) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            wake(group.queue.wake, 1);
+          }
+          return ok;
+        }
+        uint64_t sleep_ns = deadline - now;
+        if (topic_->options_.self_heal) sleep_ns = std::min(sleep_ns, topic_->heal_interval_ns());
+        const timespec relative = detail::to_timespec(sleep_ns);
+        detail::futex_wait(&w.generation, generation, &relative);
+        w.waiters.fetch_sub(1, std::memory_order_release);
+        topic_->heal(false);
+      }
     }
 
     static void wake(detail::WakeWord& w, int count) {
@@ -434,11 +529,17 @@ class Topic {
           SHM_PUBSUB_FAULT_POINT("publish.after_enqueue");
           return true;
         }
+        if (overflow == Overflow::kBlock) {
+          // The caller retries once it is outside the operation.
+          h.state.fetch_sub(detail::kQueueUnit, std::memory_order_relaxed);
+          return false;
+        }
         if (overflow != Overflow::kDropOldest || attempt == 2) break;
         if (attempt == 0) topic_->mark_dropping(slot_);
         uint64_t pos;
         uint32_t old;
         if (queue.try_claim(pos, old)) {
+          old = old == detail::kTombstone ? old : detail::cell_block(old);
           SHM_PUBSUB_FAULT_POINT("drop_oldest.after_claim");
           // Release the cell before the reference: reclamation of a dead
           // subscriber treats an unreleased claimed cell as still referenced.
@@ -481,9 +582,19 @@ class Topic {
     explicit Subscriber(Topic& topic, const SubscriberOptions& options = SubscriberOptions())
         : topic_(&topic), group_(options.group) {
       if (options.group > kMaxGroups) throw std::invalid_argument("subscriber group out of range");
+      if (!group_ && (options.overflow == Overflow::kBlock || options.durable ||
+                      options.delivery != Delivery::kAtMostOnce || options.max_deliveries)) {
+        throw std::invalid_argument("kBlock, durable, delivery and max_deliveries need a group");
+      }
+      if (options.max_deliveries > detail::kMaxDeliveryCount) {
+        throw std::invalid_argument("max_deliveries out of range");
+      }
       if (group_) {
         topic.claim_group_policy(
-            group_, detail::make_policy(static_cast<uint32_t>(options.overflow), false, 0, 0));
+            group_,
+            detail::make_policy(static_cast<uint32_t>(options.overflow), options.durable,
+                                static_cast<uint32_t>(options.delivery), options.max_deliveries));
+        wakes_space_ = options.overflow == Overflow::kBlock;
       }
       fd_ = topic.open_endpoint_fd();
       try {
@@ -548,16 +659,18 @@ class Topic {
       begin(detail::kOpTake, detail::kNoBlock);
       for (;;) {
         uint64_t pos;
-        uint32_t id;
-        if (!queue.try_claim(pos, id)) {
+        uint32_t cell;
+        if (!queue.try_claim(pos, cell)) {
           end();
           return Status::kWouldBlock;
         }
         SHM_PUBSUB_FAULT_POINT("take.after_claim");
-        if (id == detail::kTombstone) {
+        if (cell == detail::kTombstone) {
           queue.release(pos);
+          if (wakes_space_) topic_->wake_space(group_);
           continue;
         }
+        const uint32_t id = detail::cell_block(cell);
         if (id >= kBlockCount) {
           queue.release(pos);
           end();
@@ -565,12 +678,13 @@ class Topic {
         }
         // One atomic step turns the queue reference into this slot's holder
         // bit, so a crash leaves exactly one of the two.
-        topic_->record_loan(slot_, id);
+        topic_->record_loan(slot_, cell);
         topic_->header(id).state.fetch_add((1ULL << slot_) - detail::kQueueUnit,
                                            std::memory_order_acq_rel);
         SHM_PUBSUB_FAULT_POINT("take.after_convert");
         queue.release(pos);
         end();
+        if (wakes_space_) topic_->wake_space(group_);
         ++held_;
         auto& stats = topic_->slot(slot_).stats;
         stats.held_loans.store(held_, std::memory_order_relaxed);
@@ -582,6 +696,7 @@ class Topic {
         }
         out.owner_ = this;
         out.id_ = id;
+        out.delivery_ = detail::cell_attempt(cell) + 1;
         return Status::kOk;
       }
     }
@@ -726,6 +841,21 @@ class Topic {
       topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
     }
 
+    Status requeue_loan(uint32_t id, uint32_t delivered) {
+      if (!group_) return Status::kInvalidArgument;
+      begin(detail::kOpRequeue, id);
+      const Status status = topic_->redeliver(group_, id, delivered, slot_, false);
+      end();
+      if (status == Status::kQueueFull) return status;
+      --held_;
+      topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
+      if (status == Status::kOk) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        Publisher::wake(source().wake, 1);
+      }
+      return status;
+    }
+
     Topic* topic_;
     uint32_t group_;
     int fd_ = -1;
@@ -734,6 +864,7 @@ class Topic {
     uint64_t counter_ = 0;
     uint64_t stalled_since_ = 0;
     bool subscribed_ = false;
+    bool wakes_space_ = false;
     std::atomic<bool> running_{true};
   };
 
@@ -762,9 +893,14 @@ class Topic {
     uint64_t member_mask;
     bool policy_set;
     Overflow overflow;
+    bool durable;
+    Delivery delivery;
+    uint32_t max_deliveries;
     uint64_t queue_depth;
     uint64_t dropped_newest;
     uint64_t dropped_oldest;
+    uint64_t redelivered;
+    uint64_t dead_lettered;
   };
   struct Snapshot {
     uint32_t layout_version = 0;
@@ -1196,7 +1332,8 @@ class Topic {
   void forget_loan(uint32_t i, uint32_t id) {
     auto& s = slot(i);
     for (uint32_t k = 0; k < kLoanEntries; ++k) {
-      if (s.held[k].load(std::memory_order_relaxed) == id) {
+      const uint32_t entry = s.held[k].load(std::memory_order_relaxed);
+      if (entry != detail::kNoEntry && detail::cell_block(entry) == id) {
         s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
         return;
       }
@@ -1237,8 +1374,53 @@ class Topic {
     while (q.try_claim(pos, id)) {
       q.release(pos);
       SHM_PUBSUB_FAULT_POINT("group.drain_after_release");
+      id = detail::cell_block(id);
       if (id < kBlockCount) release_bits(id, detail::kQueueUnit);
     }
+  }
+
+  void wake_space(uint32_t g) {
+    detail::WakeWord& w = group(g).space;
+    // Pairs with the fence in deliver_blocking().
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (w.waiters.load(std::memory_order_relaxed) == 0) return;
+    w.generation.fetch_add(1, std::memory_order_release);
+    detail::futex_wake(&w.generation, INT_MAX);
+  }
+
+  // Moves slot i's hold on block id back into group g's queue, or drops it
+  // once the group's max_deliveries is reached. The queue reference is
+  // added before the holder bit goes, so a crash in between duplicates the
+  // message rather than losing it. `reclaiming` clears the bit of a dead
+  // slot idempotently.
+  Status redeliver(uint32_t g, uint32_t id, uint32_t delivered, uint32_t i, bool reclaiming) {
+    auto& rec = group(g);
+    const uint32_t max = detail::policy_max_deliveries(rec.policy.load(std::memory_order_relaxed));
+    Status status = Status::kDeadLettered;
+    if (max && delivered >= max) {
+      rec.dead_lettered.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      header(id).state.fetch_add(detail::kQueueUnit, std::memory_order_acq_rel);
+      if (!rec.queue.try_enqueue(detail::make_cell(id, delivered))) {
+        header(id).state.fetch_sub(detail::kQueueUnit, std::memory_order_acq_rel);
+        return Status::kQueueFull;
+      }
+      SHM_PUBSUB_FAULT_POINT("redeliver.after_enqueue");
+      rec.redelivered.fetch_add(1, std::memory_order_relaxed);
+      status = Status::kOk;
+    }
+    if (reclaiming) {
+      clear_holder(id, i);
+    } else {
+      release_bits(id, 1ULL << i);
+    }
+    forget_loan(i, id);
+    return status;
+  }
+
+  bool at_least_once(uint32_t g) {
+    return detail::policy_delivery(group(g).policy.load(std::memory_order_relaxed)) ==
+           static_cast<uint32_t>(Delivery::kAtLeastOnce);
   }
 
   // The caller holds slot i's lock byte, so no owner can use the slot. The
@@ -1293,12 +1475,7 @@ class Topic {
           return false;
         }
         SHM_PUBSUB_FAULT_POINT("reclaim.after_resolve");
-        const uint32_t in_flight = detail::activity_block(last);
-        if (last_op == detail::kOpPublish && !resumed && !(last & detail::kActivityDropping) &&
-            in_flight < kBlockCount && recount_block(in_flight, wait_ns, 1ULL << i)) {
-          may_leak = false;
-          if (report) ++report->blocks_recounted;
-        }
+        if (recount_in_flight(i, last, resumed, wait_ns, report)) may_leak = false;
       }
     } else {
       // Pairs with the fence in publish: either the publisher sees the slot
@@ -1331,7 +1508,15 @@ class Topic {
           return false;
         }
       }
+      if (!graceful && last_op == detail::kOpRequeue &&
+          recount_in_flight(i, last, resumed, wait_ns, report)) {
+        may_leak = false;
+      }
       drain_dead_queue(s.queue, i);
+      if (member && !graceful && at_least_once(g) && !requeue_held(i, g, counter, wait_ns)) {
+        end_activity(i, counter);
+        return false;
+      }
       if (member) {
         begin_activity(i, counter, detail::kOpLeave, detail::kNoBlock);
         leave_group(g, i);
@@ -1339,7 +1524,7 @@ class Topic {
       }
     }
     for (uint32_t k = 0; k < kLoanEntries; ++k) {
-      const uint32_t id = s.held[k].load(std::memory_order_relaxed);
+      const uint32_t id = detail::cell_block(s.held[k].load(std::memory_order_relaxed));
       if (id < kBlockCount) clear_holder(id, i);
       s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
     }
@@ -1351,6 +1536,58 @@ class Topic {
     if (may_leak) {
       region_->repair_pending.store(1, std::memory_order_relaxed);
       if (leak) *leak = true;
+    }
+    return true;
+  }
+
+  // The block a dead publisher (or requeuing member) was delivering may
+  // carry a queue reference that never reached a queue.
+  bool recount_in_flight(uint32_t i, uint64_t last, bool resumed, uint64_t wait_ns,
+                         RecoveryReport* report) {
+    const uint32_t op = detail::activity_op(last);
+    const uint32_t id = detail::activity_block(last);
+    if ((op != detail::kOpPublish && op != detail::kOpRequeue) || resumed ||
+        (last & detail::kActivityDropping) || id >= kBlockCount ||
+        !recount_block(id, wait_ns, 1ULL << i)) {
+      return false;
+    }
+    if (report) ++report->blocks_recounted;
+    return true;
+  }
+
+  // A dead member of an at-least-once group hands its loans back to the
+  // group. Runs as a requeue operation so that local repair elsewhere waits
+  // for it. Fails, to be retried later, while the group queue stays full.
+  bool requeue_held(uint32_t i, uint32_t g, uint64_t& counter, uint64_t wait_ns) {
+    auto& s = slot(i);
+    const uint64_t deadline = detail::monotonic_ns() + wait_ns;
+    bool requeued = false;
+    for (uint32_t k = 0; k < kLoanEntries; ++k) {
+      const uint32_t entry = s.held[k].load(std::memory_order_relaxed);
+      if (entry == detail::kNoEntry) continue;
+      const uint32_t id = detail::cell_block(entry);
+      if (id >= kBlockCount || !(header(id).state.load(std::memory_order_acquire) & (1ULL << i))) {
+        s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
+        continue;
+      }
+      begin_activity(i, counter, detail::kOpRequeue, id);
+      for (;;) {
+        const Status status = redeliver(g, id, detail::cell_attempt(entry) + 1, i, true);
+        if (status != Status::kQueueFull) {
+          requeued |= status == Status::kOk;
+          break;
+        }
+        if (detail::monotonic_ns() > deadline) {
+          begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
+          return false;
+        }
+        std::this_thread::yield();
+      }
+      begin_activity(i, counter, detail::kOpReclaim, detail::kNoBlock);
+    }
+    if (requeued) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      Publisher::wake(group(g).queue.wake, INT_MAX);
     }
     return true;
   }
@@ -1466,12 +1703,19 @@ class Topic {
       }
       uint64_t expected = pos + 1;
       if (c.sequence.load(std::memory_order_acquire) != expected) continue;
-      const uint32_t id = c.value.load(std::memory_order_relaxed);
+      const uint32_t cell = c.value.load(std::memory_order_relaxed);
+      const uint32_t id = cell == detail::kTombstone ? cell : detail::cell_block(cell);
       const uint64_t untrusted =
           id < kBlockCount
               ? header(id).state.load(std::memory_order_acquire) & detail::kHolderMask & ~trusted
               : 0;
       const bool keep = untrusted != 0;
+      if (!keep && id < kBlockCount && stuck[k].group && at_least_once(stuck[k].group)) {
+        // The claimer died before converting: deliver the message again.
+        // A crash before the release below redelivers it once more, which
+        // at-least-once allows.
+        redeliver_claimed(stuck[k].group, id, detail::cell_attempt(cell) + 1);
+      }
       SHM_PUBSUB_FAULT_POINT("repair.before_cell_release");
       if (!c.sequence.compare_exchange_strong(expected, pos + kQueueCapacity,
                                               std::memory_order_acq_rel)) {
@@ -1494,6 +1738,24 @@ class Topic {
     return true;
   }
 
+  // Adds a reference for a second copy of a claimed cell's message; the
+  // caller then drops the claimed cell's own reference.
+  void redeliver_claimed(uint32_t g, uint32_t id, uint32_t delivered) {
+    auto& rec = group(g);
+    const uint32_t max = detail::policy_max_deliveries(rec.policy.load(std::memory_order_relaxed));
+    if (max && delivered >= max) {
+      rec.dead_lettered.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    header(id).state.fetch_add(detail::kQueueUnit, std::memory_order_acq_rel);
+    if (rec.queue.try_enqueue(detail::make_cell(id, delivered))) {
+      rec.redelivered.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      header(id).state.fetch_sub(detail::kQueueUnit, std::memory_order_acq_rel);
+      rec.dropped_newest.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   uint64_t dead_members(uint32_t g, uint64_t live) const {
     uint64_t mask = 0;
     if (g == 0) return 0;
@@ -1512,7 +1774,8 @@ class Topic {
       if (pos == skip) continue;
       const auto& c = q.cell(pos);
       const uint64_t seq = c.sequence.load(std::memory_order_acquire);
-      if ((seq == pos + 1 || seq == pos) && c.value.load(std::memory_order_relaxed) == id) {
+      if ((seq == pos + 1 || seq == pos) &&
+          detail::cell_block(c.value.load(std::memory_order_relaxed)) == id) {
         return true;
       }
     }
@@ -1529,7 +1792,7 @@ class Topic {
     for (uint64_t pos = d >= kQueueCapacity ? d - kQueueCapacity : 0; pos < d; ++pos) {
       const auto& c = q.cell(pos);
       if (c.sequence.load(std::memory_order_acquire) == pos + 1 &&
-          c.value.load(std::memory_order_relaxed) == id) {
+          detail::cell_block(c.value.load(std::memory_order_relaxed)) == id) {
         return false;
       }
     }
@@ -1537,7 +1800,7 @@ class Topic {
       const auto& c = q.cell(pos);
       const uint64_t seq = c.sequence.load(std::memory_order_acquire);
       if (seq == pos) return false;
-      if (c.value.load(std::memory_order_relaxed) != id) continue;
+      if (detail::cell_block(c.value.load(std::memory_order_relaxed)) != id) continue;
       if (seq == pos + 1) {
         ++refs;
       } else if (seq == pos + kQueueCapacity) {
@@ -1597,7 +1860,8 @@ class Topic {
       auto& c = q.cell(pos);
       uint64_t seq = c.sequence.load(std::memory_order_acquire);
       if (seq != pos + 1) continue;
-      const uint32_t id = c.value.load(std::memory_order_relaxed);
+      const uint32_t raw = c.value.load(std::memory_order_relaxed);
+      const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
       if (!c.sequence.compare_exchange_strong(seq, pos + kQueueCapacity,
                                               std::memory_order_acq_rel)) {
         continue;
@@ -1615,7 +1879,8 @@ class Topic {
       auto& c = q.cell(pos);
       uint64_t seq = c.sequence.load(std::memory_order_acquire);
       if (seq != pos + 1) continue;
-      const uint32_t id = c.value.load(std::memory_order_relaxed);
+      const uint32_t raw = c.value.load(std::memory_order_relaxed);
+      const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
       if (!c.sequence.compare_exchange_strong(seq, pos + kQueueCapacity,
                                               std::memory_order_acq_rel)) {
         continue;
@@ -1648,7 +1913,8 @@ class Topic {
     for (uint64_t pos = d; pos < e; ++pos) {
       const uint64_t seq = q.cell(pos).sequence.load(std::memory_order_acquire);
       if (seq == pos + 1) {
-        const uint32_t id = q.cell(pos).value.load(std::memory_order_relaxed);
+        const uint32_t raw = q.cell(pos).value.load(std::memory_order_relaxed);
+        const uint32_t id = raw == detail::kTombstone ? raw : detail::cell_block(raw);
         if (id < kBlockCount) {
           ++refs[id];
         } else if (id != detail::kTombstone) {
@@ -1790,9 +2056,14 @@ class Topic {
       const uint32_t policy = rec.policy.load(std::memory_order_relaxed);
       info.policy_set = (policy & detail::kPolicySet) != 0;
       info.overflow = static_cast<Overflow>(detail::policy_overflow(policy));
+      info.durable = detail::policy_durable(policy);
+      info.delivery = static_cast<Delivery>(detail::policy_delivery(policy));
+      info.max_deliveries = detail::policy_max_deliveries(policy);
       info.queue_depth = rec.queue.size_approx();
       info.dropped_newest = rec.dropped_newest.load(std::memory_order_relaxed);
       info.dropped_oldest = rec.dropped_oldest.load(std::memory_order_relaxed);
+      info.redelivered = rec.redelivered.load(std::memory_order_relaxed);
+      info.dead_lettered = rec.dead_lettered.load(std::memory_order_relaxed);
       snap.groups.push_back(info);
     }
     return snap;

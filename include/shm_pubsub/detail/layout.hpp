@@ -49,9 +49,28 @@ inline uint64_t queue_refs(uint64_t state) { return state >> kMaxHolderBits; }
 
 // Slot activity word, used both as a journal for diagnostics and as a seqlock
 // for recovery: counter (bits 32-63), operation (bits 24-31), block (0-23).
-enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim, kOpLeave };
+enum Op : uint32_t {
+  kOpIdle = 0,
+  kOpLoan,
+  kOpPublish,
+  kOpTake,
+  kOpRelease,
+  kOpReclaim,
+  kOpLeave,
+  kOpRequeue,
+};
 constexpr uint32_t kNoBlock = 0xffffff;
 constexpr uint32_t kNoEntry = 0xffffffffu;
+
+// Queue cells and loan-table entries hold a block id in the low 24 bits and,
+// in group queues, how often the message was delivered before in the top 8.
+constexpr uint32_t kCellBlockMask = 0xffffff;
+constexpr uint32_t kMaxDeliveryCount = 254;
+inline uint32_t cell_block(uint32_t v) { return v & kCellBlockMask; }
+inline uint32_t cell_attempt(uint32_t v) { return v >> 24; }
+inline uint32_t make_cell(uint32_t id, uint32_t attempt) {
+  return id | ((attempt < kMaxDeliveryCount ? attempt : kMaxDeliveryCount) << 24);
+}
 // Set on a publish that started dropping the oldest entries of a full
 // queue: a death in that phase can leak a block that is not the one being
 // published.
@@ -146,6 +165,9 @@ struct alignas(64) GroupRecord {
   std::atomic<uint32_t> policy;
   std::atomic<uint64_t> dropped_newest;
   std::atomic<uint64_t> dropped_oldest;
+  std::atomic<uint64_t> redelivered;
+  std::atomic<uint64_t> dead_lettered;
+  WakeWord space;  // kBlock publishers waiting for a free cell
   MpmcQueue<kQueueCapacity> queue;
 
   void init() {
@@ -153,6 +175,9 @@ struct alignas(64) GroupRecord {
     policy.store(0, std::memory_order_relaxed);
     dropped_newest.store(0, std::memory_order_relaxed);
     dropped_oldest.store(0, std::memory_order_relaxed);
+    redelivered.store(0, std::memory_order_relaxed);
+    dead_lettered.store(0, std::memory_order_relaxed);
+    space.init();
     queue.init();
   }
 };

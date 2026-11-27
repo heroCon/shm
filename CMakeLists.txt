@@ -50,7 +50,7 @@ if(SHM_PUBSUB_BUILD_TESTS)
   set(SHM_PUBSUB_TESTS free_list_test mpmc_queue_test semantics_test multiprocess_test
                        fairness_test wakeup_test crash_leak_test crash_matrix_test stress_test
                        wait_set_test header_collision_test membership_test
-                       slot_contention_test local_repair_test)
+                       slot_contention_test local_repair_test work_queue_test)
   foreach(test ${SHM_PUBSUB_TESTS})
     add_executable(${test} tests/${test}.cpp)
     shm_pubsub_internal_target(${test})
@@ -59,6 +59,7 @@ if(SHM_PUBSUB_BUILD_TESTS)
   endforeach()
   target_compile_definitions(crash_matrix_test PRIVATE SHM_PUBSUB_FAULT_INJECTION)
   target_compile_definitions(local_repair_test PRIVATE SHM_PUBSUB_FAULT_INJECTION)
+  target_compile_definitions(work_queue_test PRIVATE SHM_PUBSUB_FAULT_INJECTION)
   # Counts context switches, so CPU contention from parallel tests skews it.
   set_tests_properties(wakeup_test PROPERTIES RUN_SERIAL TRUE)
 endif()

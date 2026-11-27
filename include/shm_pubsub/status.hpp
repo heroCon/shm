@@ -23,6 +23,7 @@ enum class Status {
   kTimedOut,         // blocking call reached its deadline
   kStopped,          // stop() cancelled a blocking call
   kBusy,             // recover(): no quiescent window observed; retry later
+  kDeadLettered,     // requeue(): max_deliveries reached; the message was dropped
 };
 
 inline const char* to_string(Status status) {
@@ -57,6 +58,8 @@ inline const char* to_string(Status status) {
       return "timed_out";
     case Status::kStopped:
       return "stopped";
+    case Status::kDeadLettered:
+      return "dead_lettered";
     case Status::kBusy:
       return "busy";
   }
@@ -66,6 +69,13 @@ inline const char* to_string(Status status) {
 enum class Overflow : uint32_t {
   kDropNewest = 0,  // a full queue rejects the new message
   kDropOldest = 1,  // the publisher discards the oldest queued message
+  kBlock = 2,       // groups only: the publisher waits up to Options::block_timeout
+};
+
+// What a group does with messages a member held when it died.
+enum class Delivery : uint32_t {
+  kAtMostOnce = 0,   // they are dropped
+  kAtLeastOnce = 1,  // they go back to the group queue for another member
 };
 
 struct PublishResult {
