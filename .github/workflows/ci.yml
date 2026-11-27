@@ -28,7 +28,10 @@ jobs:
       - name: Smoke benchmarks
         run: |
           build/throughput_benchmark 1 20000 64
+          build/throughput_benchmark 2 20000 64 --publishers 2 --batch 2 --no-timestamps
+          build/throughput_benchmark 1 20000 64 --publishers 2 --idle
           build/latency_benchmark 2000 64 futex
+          build/control_path_benchmark
 
   sanitizers:
     name: ${{ matrix.name }}
