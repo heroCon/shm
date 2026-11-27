@@ -13,8 +13,8 @@ toolchains, daemons or threads (eCAL, for example, runs registration threads in 
 process), and the one whose behaviour under `SIGKILL` is specified and tested point by
 point.
 
-On this 4-vCPU VM, 2000 samples of 64-byte futex delivery measured p50 3.962 µs
-and p99 5.750 µs (`docs/comparison-vm.csv`, from `scripts/compare-bench.sh`).
+On this 4-vCPU VM, 2000 samples of 64-byte futex delivery measured p50 3.937 µs
+and p99 5.245 µs (`docs/comparison-vm.csv`, from `scripts/compare-bench.sh`).
 iceoryx2 and eCAL were not installed on that machine, so the file has no row
 for them.
 
