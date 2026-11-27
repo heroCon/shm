@@ -51,6 +51,7 @@ inline uint64_t queue_refs(uint64_t state) { return state >> kMaxHolderBits; }
 // for recovery: counter (bits 32-63), operation (bits 24-31), block (0-23).
 enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim, kOpLeave };
 constexpr uint32_t kNoBlock = 0xffffff;
+constexpr uint32_t kNoEntry = 0xffffffffu;
 inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0xff; }
 inline uint32_t activity_block(uint64_t v) { return static_cast<uint32_t>(v) & 0xffffff; }
 
@@ -84,7 +85,10 @@ struct alignas(64) SlotStats {
 // The first cache line is read by every publisher on every publish and
 // written only on activation and reclamation. The second holds words the
 // owner writes on every operation.
-template <uint32_t kQueueCapacity>
+// Each slot lists the blocks it may hold a bit on. An id is recorded before
+// the holder bit is set and forgotten after it is cleared, so the table is a
+// superset of the slot's bits and reclamation never scans the whole pool.
+template <uint32_t kQueueCapacity, uint32_t kLoanEntries>
 struct alignas(64) Slot {
   std::atomic<uint64_t> lifecycle;
   std::atomic<uint32_t> pid;
@@ -94,6 +98,7 @@ struct alignas(64) Slot {
   alignas(64) std::atomic<uint64_t> activity;
   std::atomic<uint64_t> next_sequence;
   std::atomic<uint64_t> pinned;  // publisher slots: subscriber slots being delivered to
+  std::atomic<uint32_t> held[kLoanEntries];
   SlotStats stats;
   MpmcQueue<kQueueCapacity> queue;
 
@@ -102,6 +107,7 @@ struct alignas(64) Slot {
     activity.store(0, std::memory_order_relaxed);
     next_sequence.store(0, std::memory_order_relaxed);
     pinned.store(0, std::memory_order_relaxed);
+    for (uint32_t k = 0; k < kLoanEntries; ++k) held[k].store(kNoEntry, std::memory_order_relaxed);
     pid.store(0, std::memory_order_relaxed);
     group.store(0, std::memory_order_relaxed);
     overflow.store(0, std::memory_order_relaxed);
@@ -144,6 +150,13 @@ struct alignas(64) GroupRecord {
   }
 };
 
+template <class Config>
+constexpr uint32_t loan_entries() {
+  return Config::kMaxLoansPerPublisher + Config::kPublisherCache > Config::kMaxLoansPerSubscriber
+             ? Config::kMaxLoansPerPublisher + Config::kPublisherCache
+             : Config::kMaxLoansPerSubscriber;
+}
+
 // Region header followed by the slot table and group queues. Data blocks
 // follow at blocks_offset(). Group index 0 is unused so that group ids map
 // directly to array indices.
@@ -161,7 +174,8 @@ struct Region {
   uint32_t max_groups;
   uint32_t queue_capacity;
   alignas(64) LockFreeFreeList<uint32_t, Config::kBlockCount> free_list;
-  Slot<Config::kQueueCapacity> slots[Config::kMaxPublishers + Config::kMaxSubscribers];
+  Slot<Config::kQueueCapacity, loan_entries<Config>()>
+      slots[Config::kMaxPublishers + Config::kMaxSubscribers];
   GroupRecord<Config::kQueueCapacity> groups[Config::kMaxGroups + 1];
 };
 
@@ -186,8 +200,9 @@ uint64_t config_hash() {
   h = fnv_mix(h, Config::kMaxLoansPerPublisher);
   h = fnv_mix(h, Config::kMaxLoansPerSubscriber);
   h = fnv_mix(h, Config::kTimestamps ? 1 : 0);
+  h = fnv_mix(h, Config::kPublisherCache);
   h = fnv_mix(h, sizeof(Region<Config>));
-  h = fnv_mix(h, sizeof(Slot<Config::kQueueCapacity>));
+  h = fnv_mix(h, sizeof(Slot<Config::kQueueCapacity, loan_entries<Config>()>));
   h = fnv_mix(h, alignof(Region<Config>));
   h = fnv_mix(h, sizeof(void*));
   return h;

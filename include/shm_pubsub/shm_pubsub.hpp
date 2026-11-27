@@ -46,6 +46,9 @@ struct DefaultConfig {
   static constexpr uint32_t kMaxLoansPerPublisher = 2;
   static constexpr uint32_t kMaxLoansPerSubscriber = 2;
   static constexpr bool kTimestamps = true;  // stamp CLOCK_MONOTONIC on every publish
+  // Blocks each publisher may keep for reuse instead of returning them to the
+  // shared free list. Counted in the pool budget.
+  static constexpr uint32_t kPublisherCache = 0;
 };
 
 struct Options {
@@ -82,6 +85,8 @@ class Topic {
   static constexpr uint32_t kMaxGroups = Config::kMaxGroups;
   static constexpr uint32_t kMaxLoansPerPublisher = Config::kMaxLoansPerPublisher;
   static constexpr uint32_t kMaxLoansPerSubscriber = Config::kMaxLoansPerSubscriber;
+  static constexpr uint32_t kPublisherCache = Config::kPublisherCache;
+  static constexpr uint32_t kLoanEntries = detail::loan_entries<Config>();
   static constexpr uint32_t kSlots = kMaxPublishers + kMaxSubscribers;
   static constexpr size_t kMaxPayload = kBlockSize - sizeof(detail::BlockHeader);
   // Every reference a block can have is bounded, so a pool of this size can
@@ -89,7 +94,7 @@ class Topic {
   static constexpr uint64_t kRequiredBlocks =
       static_cast<uint64_t>(kMaxSubscribers + kMaxGroups) * kQueueCapacity +
       static_cast<uint64_t>(kMaxSubscribers) * kMaxLoansPerSubscriber +
-      static_cast<uint64_t>(kMaxPublishers) * kMaxLoansPerPublisher;
+      static_cast<uint64_t>(kMaxPublishers) * (kMaxLoansPerPublisher + kPublisherCache);
 
   static_assert(kBlockSize % 64 == 0 && kBlockSize > sizeof(detail::BlockHeader),
                 "kBlockSize must be a multiple of 64 larger than the block header");
@@ -105,7 +110,8 @@ class Topic {
   static_assert(kMaxLoansPerPublisher >= 1 && kMaxLoansPerSubscriber >= 1,
                 "endpoints need at least one loan");
   static_assert(kBlockCount >= kRequiredBlocks,
-                "kBlockCount must cover (subscribers + groups) * queue capacity plus all loans");
+                "kBlockCount must cover (subscribers + groups) * queue capacity plus all loans "
+                "and publisher caches");
 
   class Publisher;
   class Subscriber;
@@ -296,7 +302,7 @@ class Topic {
         }
       }
       SHM_PUBSUB_FAULT_POINT("publish.before_release");
-      topic_->release_bits(id, 1ULL << slot_);
+      drop_own(id);
       --held_;
       slot.stats.held_loans.store(held_, std::memory_order_relaxed);
       if (wakes) {
@@ -353,13 +359,21 @@ class Topic {
 
     bool try_loan(size_t size, uint32_t& id) {
       begin(detail::kOpLoan, detail::kNoBlock);
-      if (!topic_->region_->free_list.pop(id)) {
-        end();
-        return false;
+      detail::BlockHeader* hp;
+      if (cached_) {
+        id = cache_[--cached_];
+        hp = &topic_->header(id);
+      } else {
+        if (!topic_->region_->free_list.pop(id)) {
+          end();
+          return false;
+        }
+        SHM_PUBSUB_FAULT_POINT("loan.after_pop");
+        topic_->record_loan(slot_, id);
+        hp = &topic_->header(id);
+        hp->state.store(1ULL << slot_, std::memory_order_release);
       }
-      SHM_PUBSUB_FAULT_POINT("loan.after_pop");
-      detail::BlockHeader& h = topic_->header(id);
-      h.state.store(1ULL << slot_, std::memory_order_relaxed);
+      detail::BlockHeader& h = *hp;
       h.size = static_cast<uint32_t>(size);
       h.publisher = slot_;
       SHM_PUBSUB_FAULT_POINT("loan.after_claim");
@@ -390,7 +404,7 @@ class Topic {
           // subscriber treats an unreleased claimed cell as still referenced.
           queue.release(pos);
           SHM_PUBSUB_FAULT_POINT("drop_oldest.after_release_cell");
-          if (old < kBlockCount) topic_->release_bits(old, detail::kQueueUnit);
+          if (old < kBlockCount) adopt_or_release(old);
           dropped_oldest.fetch_add(1, std::memory_order_relaxed);
           ++r.dropped_oldest;
         }
@@ -402,10 +416,38 @@ class Topic {
 
     void release_loan(uint32_t id) {
       begin(detail::kOpRelease, id);
-      topic_->release_bits(id, 1ULL << slot_);
+      drop_own(id);
       end();
       --held_;
       topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
+    }
+
+    // Drops this publisher's bit, or keeps the block in the cache when the
+    // bit is its only reference.
+    void drop_own(uint32_t id) {
+      const uint64_t own = 1ULL << slot_;
+      if (cached_ < kPublisherCache &&
+          topic_->header(id).state.load(std::memory_order_acquire) == own) {
+        cache_[cached_++] = id;
+        return;
+      }
+      topic_->release_bits(id, own);
+      topic_->forget_loan(slot_, id);
+    }
+
+    // Takes over a dropped block whose last reference was the queue cell.
+    void adopt_or_release(uint32_t id) {
+      if (cached_ < kPublisherCache) {
+        topic_->record_loan(slot_, id);
+        uint64_t expected = detail::kQueueUnit;
+        if (topic_->header(id).state.compare_exchange_strong(expected, 1ULL << slot_,
+                                                             std::memory_order_acq_rel)) {
+          cache_[cached_++] = id;
+          return;
+        }
+        topic_->forget_loan(slot_, id);
+      }
+      topic_->release_bits(id, detail::kQueueUnit);
     }
 
     Topic* topic_;
@@ -413,6 +455,8 @@ class Topic {
     uint32_t slot_ = 0;
     uint32_t held_ = 0;
     uint64_t counter_ = 0;
+    uint32_t cache_[kPublisherCache ? kPublisherCache : 1];
+    uint32_t cached_ = 0;
   };
 
   // A subscriber endpoint. Not thread-safe except for stop(), which any
@@ -502,6 +546,7 @@ class Topic {
         }
         // One atomic step turns the queue reference into this slot's holder
         // bit, so a crash leaves exactly one of the two.
+        topic_->record_loan(slot_, id);
         topic_->header(id).state.fetch_add((1ULL << slot_) - detail::kQueueUnit,
                                            std::memory_order_acq_rel);
         SHM_PUBSUB_FAULT_POINT("take.after_convert");
@@ -616,6 +661,7 @@ class Topic {
     void release_loan(uint32_t id) {
       begin(detail::kOpRelease, id);
       topic_->release_bits(id, 1ULL << slot_);
+      topic_->forget_loan(slot_, id);
       end();
       --held_;
       topic_->slot(slot_).stats.held_loans.store(held_, std::memory_order_relaxed);
@@ -765,7 +811,7 @@ class Topic {
 
  private:
   using Region = detail::Region<Config>;
-  using SlotRecord = detail::Slot<kQueueCapacity>;
+  using SlotRecord = detail::Slot<kQueueCapacity, kLoanEntries>;
   using GroupRecord = detail::GroupRecord<kQueueCapacity>;
   using Queue = detail::MpmcQueue<kQueueCapacity>;
 
@@ -1023,6 +1069,25 @@ class Topic {
     return false;
   }
 
+  void record_loan(uint32_t i, uint32_t id) {
+    auto& s = slot(i);
+    for (uint32_t k = 0; k < kLoanEntries; ++k) {
+      if (s.held[k].load(std::memory_order_relaxed) == detail::kNoEntry) {
+        s.held[k].store(id, std::memory_order_relaxed);
+        return;
+      }
+    }
+  }
+  void forget_loan(uint32_t i, uint32_t id) {
+    auto& s = slot(i);
+    for (uint32_t k = 0; k < kLoanEntries; ++k) {
+      if (s.held[k].load(std::memory_order_relaxed) == id) {
+        s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
+        return;
+      }
+    }
+  }
+
   static uint64_t member_bit(uint32_t slot_index) { return 1ULL << (slot_index - kMaxPublishers); }
 
   // The first member fixes the group's policy; later members must match it.
@@ -1099,7 +1164,11 @@ class Topic {
       const uint32_t g = s.group.load(std::memory_order_relaxed);
       if (g >= 1 && g <= kMaxGroups) leave_group(g, i);
     }
-    for (uint32_t id = 0; id < kBlockCount; ++id) clear_holder(id, i);
+    for (uint32_t k = 0; k < kLoanEntries; ++k) {
+      const uint32_t id = s.held[k].load(std::memory_order_relaxed);
+      if (id < kBlockCount) clear_holder(id, i);
+      s.held[k].store(detail::kNoEntry, std::memory_order_relaxed);
+    }
     s.queue.init();
     s.stats.held_loans.store(0, std::memory_order_relaxed);
     end_activity(i, counter);
@@ -1342,6 +1411,10 @@ template <class C>
 constexpr uint32_t Topic<C>::kMaxLoansPerPublisher;
 template <class C>
 constexpr uint32_t Topic<C>::kMaxLoansPerSubscriber;
+template <class C>
+constexpr uint32_t Topic<C>::kPublisherCache;
+template <class C>
+constexpr uint32_t Topic<C>::kLoanEntries;
 template <class C>
 constexpr uint32_t Topic<C>::kSlots;
 template <class C>
