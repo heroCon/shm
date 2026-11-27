@@ -89,6 +89,14 @@ if(SHM_PUBSUB_BUILD_C)
   if(SHM_PUBSUB_BUILD_TESTS)
     add_executable(c_api_test bindings/c/test_c.c)
     target_link_libraries(c_api_test PRIVATE shm_pubsub_c)
+    # CI passes sanitizers only through CMAKE_CXX_FLAGS, so the C++ library is
+    # instrumented and this C executable is not. ASan then aborts at startup
+    # because its runtime is not first in the initial library list. Repeat the
+    # -fsanitize= link flags on the executable.
+    if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=")
+      string(REGEX MATCHALL "-fsanitize=[^ ]+" shm_pubsub_sanitizers "${CMAKE_CXX_FLAGS}")
+      target_link_options(c_api_test PRIVATE ${shm_pubsub_sanitizers})
+    endif()
     add_test(NAME c_api_test COMMAND c_api_test)
   endif()
   if(SHM_PUBSUB_INSTALL)
