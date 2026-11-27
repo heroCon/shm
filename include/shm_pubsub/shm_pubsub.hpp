@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -469,6 +470,9 @@ class Topic {
       if (!subscribed_) return Status::kNotSubscribed;
       if (held_ >= kMaxLoansPerSubscriber) return Status::kLoanLimit;
       auto& queue = source();
+      // An empty poll writes nothing, so idle busy-polling readers do not
+      // keep recover() from observing a quiescent snapshot.
+      if (!queue.head_ready()) return Status::kWouldBlock;
       begin(detail::kOpTake, detail::kNoBlock);
       for (;;) {
         uint64_t pos;
@@ -892,11 +896,34 @@ class Topic {
   }
 
   // Locks a free slot byte with the endpoint's own description, reclaiming
-  // leftovers of a previous owner that died.
+  // leftovers of a previous owner that died. recover() briefly locks every
+  // free slot byte, so a full table is only reported after waiting for the
+  // maintenance byte and scanning again.
   uint32_t acquire_slot(int fd, uint32_t first, uint32_t last) {
+    bool contended = false;
+    uint32_t i = try_acquire_slot(fd, first, last, contended);
+    if (i != last) return i;
+    if (!contended) throw std::runtime_error("endpoint slot limit reached");
+    const auto wait = std::min(options_.initialization_timeout, std::chrono::milliseconds(100));
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    bool shared = false;
+    while (!(shared = detail::ofd_lock(fd, detail::kMaintenanceByte, F_RDLCK) == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    i = try_acquire_slot(fd, first, last, contended);
+    if (shared) detail::ofd_lock(fd, detail::kMaintenanceByte, F_UNLCK);
+    if (i == last) throw std::runtime_error("endpoint slot limit reached");
+    return i;
+  }
+
+  uint32_t try_acquire_slot(int fd, uint32_t first, uint32_t last, bool& contended) {
     for (uint32_t i = first; i < last; ++i) {
       const int error = detail::ofd_lock(fd, i, F_WRLCK);
-      if (error == EAGAIN || error == EACCES) continue;
+      if (error == EAGAIN || error == EACCES) {
+        contended = true;
+        continue;
+      }
       if (error != 0) {
         errno = error;
         throw_errno("slot lock");
@@ -905,11 +932,12 @@ class Topic {
               detail::kSlotFree &&
           !reclaim_slot(i, nullptr)) {
         detail::ofd_lock(fd, i, F_UNLCK);
+        contended = true;
         continue;
       }
       return i;
     }
-    throw std::runtime_error("endpoint slot limit reached");
+    return last;
   }
 
   // Returns the slot's activity counter. Counters never restart, so recovery
