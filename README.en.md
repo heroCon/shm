@@ -58,7 +58,7 @@ must use the same `Config`; the region header stores a hash and rejects mismatch
 ## Using it from CMake
 
 ```cmake
-find_package(shm_pubsub 0.3 REQUIRED)     # after cmake --install
+find_package(shm_pubsub 0.4 REQUIRED)     # after cmake --install
 # or: add_subdirectory(shm_pubsub)
 target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)
 ```
@@ -86,7 +86,7 @@ alternative is the better choice.
   matrix and the remaining windows.
 - [Lock-free design](docs/lock-free-design.md) and platform requirements.
 - [Benchmarks](docs/benchmark.md), [comparison](docs/comparison.md),
-  [roadmap](ROADMAP.md), [changelog](CHANGELOG.md) including 0.2 → 0.3 migration,
+  [roadmap](ROADMAP.md), [changelog](CHANGELOG.md) including 0.2 → 0.3 and 0.3 → 0.4 migration,
   and [contributing](CONTRIBUTING.md).
 
 ## Requirements and limits
@@ -95,7 +95,7 @@ Linux 3.15+ (OFD locks, process-shared futexes); `WaitSet` needs 5.16+ for
 `futex_waitv` and reports `kNotSupported` otherwise. All processes must share the
 architecture, ABI and `Config`. Delivery is in memory and at most once; there is no
 persistence or history replay. Endpoints are not thread-safe, so use one per thread.
-At most 48 endpoints per topic.
+At most 56 endpoints per topic.
 
 MIT licensed. `detail/lock_free_list.hpp` is derived from Eclipse iceoryx
 (Apache-2.0 OR MIT); see [NOTICE](NOTICE).

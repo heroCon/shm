@@ -45,7 +45,7 @@ if (sub.wait_take(read, std::chrono::milliseconds(100)) == shm_pubsub::Status::k
 ## 在 CMake 中使用
 
 ```cmake
-find_package(shm_pubsub 0.3 REQUIRED)     # 先执行 cmake --install
+find_package(shm_pubsub 0.4 REQUIRED)     # 先执行 cmake --install
 # 或：add_subdirectory(shm_pubsub)
 target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)
 ```
@@ -69,11 +69,11 @@ target_link_libraries(app PRIVATE shm_pubsub::shm_pubsub)
 - [生命周期](docs/lifecycle.md)：创建、端点存活、回收、`fork()`。
 - [崩溃一致性](docs/crash-consistency.md)：可恢复的内容、故障矩阵与剩余窗口。
 - [无锁设计](docs/lock-free-design.md)与平台要求。
-- [性能](docs/benchmark.md)、[对比](docs/comparison.md)、[路线图](ROADMAP.md)、[更新记录](CHANGELOG.md)（含 0.2 → 0.3 迁移）、[贡献指南](CONTRIBUTING.md)。
+- [性能](docs/benchmark.md)、[对比](docs/comparison.md)、[路线图](ROADMAP.md)、[更新记录](CHANGELOG.md)（含 0.2 → 0.3、0.3 → 0.4 迁移）、[贡献指南](CONTRIBUTING.md)。
 
 ## 要求与限制
 
-Linux 3.15+（OFD 锁、进程共享 futex）；`WaitSet` 需要 5.16+ 的 `futex_waitv`，否则返回 `kNotSupported`。所有进程须使用相同的体系结构、ABI 与 `Config`。投递仅在内存中且至多一次，不持久化、不回放历史。端点非线程安全，每个线程使用各自的端点。每个 topic 最多 48 个端点。
+Linux 3.15+（OFD 锁、进程共享 futex）；`WaitSet` 需要 5.16+ 的 `futex_waitv`，否则返回 `kNotSupported`。所有进程须使用相同的体系结构、ABI 与 `Config`。投递仅在内存中且至多一次，不持久化、不回放历史。端点非线程安全，每个线程使用各自的端点。每个 topic 最多 56 个端点。
 
 采用 MIT 许可证。`detail/lock_free_list.hpp` 源自 Eclipse iceoryx（Apache-2.0 OR MIT），见 [NOTICE](NOTICE)。
 
