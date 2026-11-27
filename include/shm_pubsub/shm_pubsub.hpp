@@ -272,7 +272,18 @@ class Topic {
       }
       const uint32_t id = sample.id_;
       sample.owner_ = nullptr;
-      return publish_ids(&id, 1);
+      return publish_ids(&id, 1, topic_->options_.block_timeout);
+    }
+    // As publish(), waiting at most `timeout` for room in full kBlock group
+    // queues; the status is kTimedOut if any of them stayed full.
+    PublishResult publish(WriteLoan&& sample, std::chrono::milliseconds timeout) {
+      if (sample.owner_ != this || timeout.count() < 0) {
+        PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
+        return r;
+      }
+      const uint32_t id = sample.id_;
+      sample.owner_ = nullptr;
+      return publish_ids(&id, 1, timeout);
     }
 
     // Publishes up to kMaxLoansPerPublisher loans in order with one pin pass,
@@ -291,7 +302,7 @@ class Topic {
         ids[k] = samples[k].id_;
       }
       for (size_t k = 0; k < count; ++k) samples[k].owner_ = nullptr;
-      return publish_ids(ids, count);
+      return publish_ids(ids, count, topic_->options_.block_timeout);
     }
     PublishResult publish_copy(const void* data, size_t size) {
       PublishResult r = {Status::kInvalidArgument, 0, 0, 0};
@@ -322,7 +333,8 @@ class Topic {
     void begin(uint32_t op, uint32_t id) { topic_->begin_activity(slot_, counter_, op, id); }
     void end() { topic_->end_activity(slot_, counter_); }
 
-    PublishResult publish_ids(const uint32_t* ids, size_t count) {
+    PublishResult publish_ids(const uint32_t* ids, size_t count,
+                              std::chrono::milliseconds timeout) {
       PublishResult r = {Status::kOk, 0, 0, 0};
       auto& slot = topic_->slot(slot_);
       uint64_t seq = slot.next_sequence.load(std::memory_order_relaxed);
@@ -415,12 +427,14 @@ class Topic {
       for (uint32_t g = 1; g <= kMaxGroups; ++g) {
         if (group_wakes[g]) wake(topic_->group(g).queue.wake, static_cast<int>(group_wakes[g]));
       }
-      if (any_blocked) publish_blocked(ids, count, blocked_from, r);
+      const bool timed_out = any_blocked && !publish_blocked(ids, count, blocked_from, timeout, r);
       slot.stats.published.store(slot.stats.published.load(std::memory_order_relaxed) + count,
                                  std::memory_order_relaxed);
       // A queue that stays full may be stuck behind a dead endpoint's cell.
       if (r.delivered < r.targets) topic_->heal(false);
-      if (r.targets == 0) {
+      if (timed_out) {
+        r.status = Status::kTimedOut;
+      } else if (r.targets == 0) {
         r.status = Status::kNoSubscribers;
       } else if (r.delivered == 0) {
         r.status = Status::kQueueFull;
@@ -432,11 +446,12 @@ class Topic {
 
     // Runs outside any operation and without pins, so a sleeping publisher
     // holds up neither repair nor reclamation; only its loans stay held.
-    void publish_blocked(const uint32_t* ids, size_t count, const size_t* blocked_from,
-                         PublishResult& r) {
+    // Returns false if some group stayed full until the deadline.
+    bool publish_blocked(const uint32_t* ids, size_t count, const size_t* blocked_from,
+                         std::chrono::milliseconds timeout, PublishResult& r) {
       const uint64_t deadline =
-          detail::monotonic_ns() +
-          static_cast<uint64_t>(topic_->options_.block_timeout.count()) * 1000000ULL;
+          detail::monotonic_ns() + static_cast<uint64_t>(timeout.count()) * 1000000ULL;
+      bool all = true;
       bool gave_up[kMaxGroups + 1] = {};
       size_t first = count;
       for (uint32_t g = 1; g <= kMaxGroups; ++g) first = std::min(first, blocked_from[g]);
@@ -450,6 +465,7 @@ class Topic {
             ++r.delivered;
           } else {
             gave_up[g] = true;
+            all = false;
             group.dropped_newest.fetch_add(1, std::memory_order_relaxed);
           }
         }
@@ -457,6 +473,7 @@ class Topic {
         drop_own(id);
         end();
       }
+      return all;
     }
 
     bool deliver_blocking(detail::GroupRecord<kQueueCapacity>& group, uint32_t id,

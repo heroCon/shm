@@ -210,8 +210,15 @@ void check_block() {
   uint32_t v = 100;
   const auto r = pub.publish_copy(&v, sizeof(v));
   auto waited = std::chrono::steady_clock::now() - start;
-  CHECK(r.status == Status::kQueueFull);
+  CHECK(r.status == Status::kTimedOut);
   CHECK(waited >= std::chrono::milliseconds(90));
+  {
+    Topic::WriteLoan quick;
+    CHECK(pub.loan(4, quick) == Status::kOk);
+    start = std::chrono::steady_clock::now();
+    CHECK(pub.publish(std::move(quick), std::chrono::milliseconds(10)).status == Status::kTimedOut);
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(80));
+  }
   CHECK(free_blocks(topic) == Topic::kBlockCount - Topic::kQueueCapacity);
 
   // A consumer frees a cell: the blocked publish completes.
