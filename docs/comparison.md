@@ -13,7 +13,12 @@ toolchains, daemons or threads (eCAL, for example, runs registration threads in 
 process), and the one whose behaviour under `SIGKILL` is specified and tested point by
 point.
 
-| | shm_pubsub 0.3 | iceoryx2 | iceoryx (classic) | eCAL | Flow-IPC | cpp-ipc | Boost.Interprocess |
+On this 4-vCPU VM, 2000 samples of 64-byte futex delivery measured p50 3.962 µs
+and p99 5.750 µs (`docs/comparison-vm.csv`, from `scripts/compare-bench.sh`).
+iceoryx2 and eCAL were not installed on that machine, so the file has no row
+for them.
+
+| | shm_pubsub 0.4 | iceoryx2 | iceoryx (classic) | eCAL | Flow-IPC | cpp-ipc | Boost.Interprocess |
 |---|---|---|---|---|---|---|---|
 | Language / integration | C++11 headers | Rust core, C and C++ bindings | C++ libraries | C++ libraries and tools | C++17 libraries | C++ library | C++ headers |
 | Central daemon | no | no | yes (RouDi) | no | no | no | no |

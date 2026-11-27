@@ -14,7 +14,9 @@ out=${1:-$root/docs/comparison-vm.csv}
 echo "transport,payload_bytes,samples,p50_ns,p99_ns,notes" > "$out"
 # latency_benchmark prints its own table; keep a raw copy beside the CSV.
 "$build/latency_benchmark" 2000 64 futex | tee "$out.raw"
-echo "shm_pubsub,64,2000,,,see ${out}.raw (VM)" >> "$out"
+awk -F, 'NR>1 && $1=="shm" {
+  printf "shm_pubsub,%s,%s,%.0f,%.0f,futex; microseconds in the raw file, this VM\n", $3, $4, $5*1000, $6*1000
+}' "$out.raw" >> "$out"
 if [[ -n ${ICEORYX2_PUBSUB:-} && -x $ICEORYX2_PUBSUB ]]; then
   "$ICEORYX2_PUBSUB" | tee -a "$out.raw"
   echo "iceoryx2,64,,,,see raw (VM)" >> "$out"
