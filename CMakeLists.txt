@@ -49,7 +49,8 @@ if(SHM_PUBSUB_BUILD_TESTS)
   enable_testing()
   set(SHM_PUBSUB_TESTS free_list_test mpmc_queue_test semantics_test multiprocess_test
                        fairness_test wakeup_test crash_leak_test crash_matrix_test stress_test
-                       wait_set_test header_collision_test)
+                       wait_set_test header_collision_test membership_test
+                       slot_contention_test)
   foreach(test ${SHM_PUBSUB_TESTS})
     add_executable(${test} tests/${test}.cpp)
     shm_pubsub_internal_target(${test})
@@ -62,7 +63,7 @@ if(SHM_PUBSUB_BUILD_TESTS)
 endif()
 
 if(SHM_PUBSUB_BUILD_BENCHMARKS)
-  foreach(bench latency_benchmark throughput_benchmark)
+  foreach(bench latency_benchmark throughput_benchmark control_path_benchmark)
     add_executable(${bench} benchmarks/${bench}.cpp)
     shm_pubsub_internal_target(${bench})
   endforeach()

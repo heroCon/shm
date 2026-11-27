@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -157,6 +158,64 @@ static void check_overflow(Topic& topic) {
   CHECK(snap.slots[oldest.slot()].dropped_newest == 6);
 }
 
+static void check_batch(Topic& topic) {
+  Topic::Publisher pub(topic);
+  Topic::Subscriber a(topic);
+  Topic::Subscriber b(topic);
+  Topic::WriteLoan loans[2];
+  CHECK(pub.publish(loans, 2).status == Status::kInvalidArgument);
+  for (int i = 0; i < 2; ++i) {
+    CHECK(pub.loan(1, loans[i]) == Status::kOk);
+    loans[i].data()[0] = static_cast<char>('a' + i);
+  }
+  CHECK(pub.publish(loans, 3).status == Status::kInvalidArgument);
+  CHECK(loans[0] && loans[1]);
+  const auto r = pub.publish(loans, 2);
+  CHECK(r.status == Status::kOk && r.targets == 4 && r.delivered == 4);
+  CHECK(!loans[0] && !loans[1]);
+  Topic::ReadLoan got[3];
+  CHECK(a.take(got, 3) == 2);
+  CHECK(got[0].data()[0] == 'a' && got[1].data()[0] == 'b');
+  CHECK(got[1].sequence() == got[0].sequence() + 1);
+  CHECK(got[0].timestamp_ns() != 0 && got[0].timestamp_ns() == got[1].timestamp_ns());
+  std::string seen;
+  CHECK(b.drain([&](const Topic::ReadLoan& m) { seen += m.data()[0]; }) == 2);
+  CHECK(seen == "ab");
+}
+
+struct NoTimestampConfig : SmallConfig {
+  static constexpr bool kTimestamps = false;
+};
+
+static void check_no_timestamps() {
+  ScopedName name("semantics_nots");
+  shm_pubsub::Options o;
+  o.name = name.name;
+  shm_pubsub::Topic<NoTimestampConfig> topic(o);
+  shm_pubsub::Topic<NoTimestampConfig>::Publisher pub(topic);
+  shm_pubsub::Topic<NoTimestampConfig>::Subscriber sub(topic);
+  CHECK(pub.publish_copy("x", 1).ok());
+  shm_pubsub::Topic<NoTimestampConfig>::ReadLoan loan;
+  CHECK(sub.take(loan) == Status::kOk && loan.timestamp_ns() == 0);
+}
+
+// An idle reader that busy-polls must not keep recover() from running.
+static void check_recover_with_busy_poller(Topic& topic) {
+  Topic::Subscriber sub(topic);
+  std::atomic<bool> run{true};
+  std::thread poller([&] {
+    while (run.load(std::memory_order_relaxed)) {
+      Topic::ReadLoan loan;
+      sub.take(loan);
+    }
+  });
+  int ok = 0;
+  for (int i = 0; i < 200; ++i) ok += topic.recover() == Status::kOk;
+  run = false;
+  poller.join();
+  CHECK(ok >= 190);
+}
+
 int main() {
   ScopedName name("semantics");
   shm_pubsub::Options options;
@@ -167,6 +226,8 @@ int main() {
     check_loans(topic);
     check_groups(topic);
     check_overflow(topic);
+    check_batch(topic);
+    check_recover_with_busy_poller(topic);
     CHECK(free_blocks(topic) == Topic::kBlockCount);
     bool threw = false;
     try {
@@ -176,6 +237,7 @@ int main() {
     }
     CHECK(threw);
   }
+  check_no_timestamps();
   bool threw = false;
   try {
     shm_pubsub::Options bad;
