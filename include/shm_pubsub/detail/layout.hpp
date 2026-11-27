@@ -17,7 +17,7 @@ static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_LLONG_LOCK_FREE == 2,
               "shm_pubsub requires always-lock-free 32- and 64-bit atomics");
 
 constexpr uint64_t kMagic = 0x53484d5055425355ULL;
-constexpr uint32_t kLayoutVersion = 5;
+constexpr uint32_t kLayoutVersion = 6;
 constexpr uint32_t kReady = 2;
 
 // Slot lifecycle word: state (bits 0-1), publisher pins (bits 8-31, one per
@@ -39,17 +39,19 @@ inline uint64_t make_lifecycle(uint32_t generation, uint64_t state) {
   return (static_cast<uint64_t>(generation) << 32) | state;
 }
 
-// Block state word: one holder bit per endpoint slot (bits 0-47) plus the
-// number of queue cells that reference the block (bits 48-63). The block
-// returns to the free list when the word drops to zero.
-constexpr unsigned kMaxHolderBits = 48;
+// Block state word: one holder bit per endpoint slot (bits 0-55) plus the
+// number of queue cells that reference the block (bits 56-63). A block sits
+// in a given queue at most once, so 8 bits cover every subscriber and group.
+// The block returns to the free list when the word drops to zero.
+constexpr unsigned kMaxHolderBits = 56;
+constexpr uint32_t kMaxQueueRefs = 255;
 constexpr uint64_t kHolderMask = (1ULL << kMaxHolderBits) - 1;
 constexpr uint64_t kQueueUnit = 1ULL << kMaxHolderBits;
 inline uint64_t queue_refs(uint64_t state) { return state >> kMaxHolderBits; }
 
 // Slot activity word, used both as a journal for diagnostics and as a seqlock
 // for recovery: counter (bits 32-63), operation (bits 24-31), block (0-23).
-enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim };
+enum Op : uint32_t { kOpIdle = 0, kOpLoan, kOpPublish, kOpTake, kOpRelease, kOpReclaim, kOpLeave };
 constexpr uint32_t kNoBlock = 0xffffff;
 inline uint32_t activity_op(uint64_t v) { return static_cast<uint32_t>(v >> 24) & 0xff; }
 inline uint32_t activity_block(uint64_t v) { return static_cast<uint32_t>(v) & 0xffffff; }
@@ -90,7 +92,6 @@ struct alignas(64) Slot {
   std::atomic<uint32_t> group;
   std::atomic<uint32_t> overflow;
   std::atomic<uint32_t> subscribed;
-  std::atomic<uint32_t> member;
   SlotStats stats;
   MpmcQueue<kQueueCapacity> queue;
 
@@ -102,23 +103,38 @@ struct alignas(64) Slot {
     group.store(0, std::memory_order_relaxed);
     overflow.store(0, std::memory_order_relaxed);
     subscribed.store(0, std::memory_order_relaxed);
-    member.store(0, std::memory_order_relaxed);
     stats.init();
     queue.init();
   }
 };
 
+// Group policy word, fixed by the first member for the lifetime of the
+// region: set flag (bit 31), overflow (bits 0-3), durable (bit 4), delivery
+// (bits 5-6), max deliveries (bits 8-15, 0 = unlimited).
+constexpr uint32_t kPolicySet = 1u << 31;
+inline uint32_t policy_overflow(uint32_t p) { return p & 0xf; }
+inline bool policy_durable(uint32_t p) { return (p >> 4) & 1; }
+inline uint32_t policy_delivery(uint32_t p) { return (p >> 5) & 3; }
+inline uint32_t policy_max_deliveries(uint32_t p) { return (p >> 8) & 0xff; }
+inline uint32_t make_policy(uint32_t overflow, bool durable, uint32_t delivery,
+                            uint32_t max_deliveries) {
+  return kPolicySet | (overflow & 0xf) | (durable ? 1u << 4 : 0) | ((delivery & 3) << 5) |
+         ((max_deliveries & 0xff) << 8);
+}
+
+// Membership is a bitmap (one bit per subscriber slot) so that joining and
+// leaving are single idempotent steps that a crash cannot leave half done.
 template <uint32_t kQueueCapacity>
 struct alignas(64) GroupRecord {
-  std::atomic<uint32_t> members;
-  std::atomic<uint32_t> overflow;
+  std::atomic<uint64_t> member_mask;
+  std::atomic<uint32_t> policy;
   std::atomic<uint64_t> dropped_newest;
   std::atomic<uint64_t> dropped_oldest;
   MpmcQueue<kQueueCapacity> queue;
 
   void init() {
-    members.store(0, std::memory_order_relaxed);
-    overflow.store(0, std::memory_order_relaxed);
+    member_mask.store(0, std::memory_order_relaxed);
+    policy.store(0, std::memory_order_relaxed);
     dropped_newest.store(0, std::memory_order_relaxed);
     dropped_oldest.store(0, std::memory_order_relaxed);
     queue.init();

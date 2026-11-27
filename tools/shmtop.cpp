@@ -59,10 +59,15 @@ static void print(const std::string& name, const Topic::Snapshot& snap) {
   }
   for (const auto& g : snap.groups) {
     if (!g.members && !g.queue_depth && !g.dropped_newest && !g.dropped_oldest) continue;
-    std::printf("group %u: members=%u queue=%llu drop_new=%llu drop_old=%llu\n", g.id, g.members,
-                static_cast<unsigned long long>(g.queue_depth),
-                static_cast<unsigned long long>(g.dropped_newest),
-                static_cast<unsigned long long>(g.dropped_oldest));
+    const char* policy = !g.policy_set                                     ? "unset"
+                         : g.overflow == shm_pubsub::Overflow::kDropOldest ? "drop_oldest"
+                                                                           : "drop_newest";
+    std::printf(
+        "group %u: members=%u mask=%#llx policy=%s queue=%llu drop_new=%llu drop_old=%llu\n", g.id,
+        g.members, static_cast<unsigned long long>(g.member_mask), policy,
+        static_cast<unsigned long long>(g.queue_depth),
+        static_cast<unsigned long long>(g.dropped_newest),
+        static_cast<unsigned long long>(g.dropped_oldest));
   }
 }
 

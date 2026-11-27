@@ -40,9 +40,9 @@ static void check_stalled_reader_does_not_starve_others(Topic& topic, Overflow o
   }
 }
 
-// Messages queued for a group with no active member keep their bounded
-// share of the pool and never block broadcast loans.
-static void check_group_backlog_does_not_block_broadcast(Topic& topic) {
+// When the last member leaves a non-durable group, the backlog is discarded,
+// so it neither holds pool blocks nor reaches a later member.
+static void check_group_backlog_dropped_on_last_leave(Topic& topic) {
   Topic::Publisher pub(topic);
   {
     SubscriberOptions worker;
@@ -71,7 +71,7 @@ static void check_group_backlog_does_not_block_broadcast(Topic& topic) {
     ++backlog;
     loan.reset();
   }
-  CHECK(backlog == Topic::kQueueCapacity);
+  CHECK(backlog == 0);
 }
 
 // The pool covers every bounded reference, so subscribers that hold their
@@ -111,7 +111,7 @@ int main() {
   Topic topic(options);
   check_stalled_reader_does_not_starve_others(topic, Overflow::kDropNewest);
   check_stalled_reader_does_not_starve_others(topic, Overflow::kDropOldest);
-  check_group_backlog_does_not_block_broadcast(topic);
+  check_group_backlog_dropped_on_last_leave(topic);
   check_pool_budget(topic);
   CHECK(free_blocks(topic) == Topic::kBlockCount);
   return finish("fairness_test");

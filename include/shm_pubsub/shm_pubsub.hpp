@@ -27,7 +27,7 @@
 #include "shm_pubsub/wait_set.hpp"
 
 #define SHM_PUBSUB_VERSION_MAJOR 0
-#define SHM_PUBSUB_VERSION_MINOR 3
+#define SHM_PUBSUB_VERSION_MINOR 4
 #define SHM_PUBSUB_VERSION_PATCH 0
 
 namespace shm_pubsub {
@@ -65,6 +65,7 @@ struct RecoveryReport {
   uint32_t holes_filled = 0;
   uint32_t cells_released = 0;
   uint32_t pins_cleared = 0;
+  uint32_t members_cleared = 0;
   uint32_t inconsistencies = 0;
 };
 
@@ -94,7 +95,9 @@ class Topic {
   static_assert(kMaxPublishers >= 1 && kMaxPublishers <= detail::kMaxPinBits,
                 "kMaxPublishers must be within 1..24");
   static_assert(kMaxSubscribers >= 1, "kMaxSubscribers must be at least 1");
-  static_assert(kSlots <= detail::kMaxHolderBits, "at most 48 endpoints per topic");
+  static_assert(kSlots <= detail::kMaxHolderBits, "at most 56 endpoints per topic");
+  static_assert(kMaxSubscribers + kMaxGroups <= detail::kMaxQueueRefs,
+                "too many queues for the 8-bit queue reference count");
   static_assert(kSlots < detail::kMaintenanceByte, "lock bytes overlap");
   static_assert(kMaxGroups <= 64, "kMaxGroups must be at most 64");
   static_assert(kQueueCapacity < kBlockCount, "queue capacity must be smaller than the pool");
@@ -272,10 +275,10 @@ class Topic {
       }
       for (uint32_t g = 1; g <= kMaxGroups; ++g) {
         auto& group = topic_->group(g);
-        if (group.members.load(std::memory_order_acquire) == 0) continue;
+        if (group.member_mask.load(std::memory_order_acquire) == 0) continue;
         ++r.targets;
-        const Overflow overflow =
-            static_cast<Overflow>(group.overflow.load(std::memory_order_relaxed));
+        const Overflow overflow = static_cast<Overflow>(
+            detail::policy_overflow(group.policy.load(std::memory_order_relaxed)));
         if (deliver(group.queue, id, overflow, group.dropped_newest, group.dropped_oldest, r)) {
           ++r.delivered;
           wake[wakes] = &group.queue.wake;
@@ -409,6 +412,10 @@ class Topic {
     explicit Subscriber(Topic& topic, const SubscriberOptions& options = SubscriberOptions())
         : topic_(&topic), group_(options.group) {
       if (options.group > kMaxGroups) throw std::invalid_argument("subscriber group out of range");
+      if (group_) {
+        topic.claim_group_policy(
+            group_, detail::make_policy(static_cast<uint32_t>(options.overflow), false, 0, 0));
+      }
       fd_ = topic.open_endpoint_fd();
       try {
         slot_ = topic.acquire_slot(fd_, kMaxPublishers, kSlots);
@@ -421,7 +428,6 @@ class Topic {
       s.group.store(group_, std::memory_order_relaxed);
       s.overflow.store(static_cast<uint32_t>(options.overflow), std::memory_order_relaxed);
       s.stats.init();
-      if (group_) topic.group(group_).overflow.store(static_cast<uint32_t>(options.overflow));
       counter_ = topic.activate(slot_);
       subscribe();
     }
@@ -435,18 +441,17 @@ class Topic {
     Subscriber& operator=(const Subscriber&) = delete;
 
     void subscribe() {
-      auto& s = topic_->slot(slot_);
-      if (group_ && !s.member.exchange(1, std::memory_order_acq_rel)) {
-        topic_->group(group_).members.fetch_add(1, std::memory_order_acq_rel);
-      }
-      s.subscribed.store(1, std::memory_order_release);
+      if (group_) topic_->join_group(group_, slot_);
+      topic_->slot(slot_).subscribed.store(1, std::memory_order_release);
       subscribed_ = true;
     }
+    // Leaving a non-durable group as its last member discards the backlog.
     void unsubscribe() {
-      auto& s = topic_->slot(slot_);
-      s.subscribed.store(0, std::memory_order_release);
-      if (group_ && s.member.exchange(0, std::memory_order_acq_rel)) {
-        topic_->group(group_).members.fetch_sub(1, std::memory_order_acq_rel);
+      topic_->slot(slot_).subscribed.store(0, std::memory_order_release);
+      if (group_) {
+        begin(detail::kOpLeave, detail::kNoBlock);
+        topic_->leave_group(group_, slot_);
+        end();
       }
       subscribed_ = false;
     }
@@ -635,6 +640,9 @@ class Topic {
   struct GroupInfo {
     uint32_t id;
     uint32_t members;
+    uint64_t member_mask;
+    bool policy_set;
+    Overflow overflow;
     uint64_t queue_depth;
     uint64_t dropped_newest;
     uint64_t dropped_oldest;
@@ -973,9 +981,47 @@ class Topic {
       }
     }
     for (uint32_t g = 1; g <= kMaxGroups; ++g) {
-      if (region_->groups[g].members.load(std::memory_order_relaxed)) return true;
+      if (region_->groups[g].member_mask.load(std::memory_order_relaxed)) return true;
     }
     return false;
+  }
+
+  static uint64_t member_bit(uint32_t slot_index) { return 1ULL << (slot_index - kMaxPublishers); }
+
+  // The first member fixes the group's policy; later members must match it.
+  void claim_group_policy(uint32_t g, uint32_t desired) {
+    uint32_t current = 0;
+    if (group(g).policy.compare_exchange_strong(current, desired, std::memory_order_acq_rel)) {
+      return;
+    }
+    if (current != desired) {
+      throw std::invalid_argument("subscriber options conflict with the group's policy");
+    }
+  }
+
+  void join_group(uint32_t g, uint32_t i) {
+    group(g).member_mask.fetch_or(member_bit(i), std::memory_order_acq_rel);
+  }
+
+  void leave_group(uint32_t g, uint32_t i) {
+    auto& rec = group(g);
+    const uint64_t bit = member_bit(i);
+    const uint64_t previous = rec.member_mask.fetch_and(~bit, std::memory_order_acq_rel);
+    if (previous == bit && !detail::policy_durable(rec.policy.load(std::memory_order_relaxed))) {
+      drain_group(rec.queue);
+    }
+  }
+
+  // Consumes a memberless group's backlog. A crash between releasing a cell
+  // and dropping its reference only leaks the block until recover().
+  void drain_group(Queue& q) {
+    uint64_t pos;
+    uint32_t id;
+    while (q.try_claim(pos, id)) {
+      q.release(pos);
+      SHM_PUBSUB_FAULT_POINT("group.drain_after_release");
+      if (id < kBlockCount) release_bits(id, detail::kQueueUnit);
+    }
   }
 
   // The caller holds slot i's lock byte, so no owner can use the slot. The
@@ -1018,10 +1064,8 @@ class Topic {
       }
       SHM_PUBSUB_FAULT_POINT("reclaim.after_pin_wait");
       drain_dead_queue(s.queue, i);
-      if (s.member.exchange(0, std::memory_order_acq_rel)) {
-        const uint32_t g = s.group.load(std::memory_order_relaxed);
-        if (g >= 1 && g <= kMaxGroups) group(g).members.fetch_sub(1, std::memory_order_acq_rel);
-      }
+      const uint32_t g = s.group.load(std::memory_order_relaxed);
+      if (g >= 1 && g <= kMaxGroups) leave_group(g, i);
     }
     for (uint32_t id = 0; id < kBlockCount; ++id) clear_holder(id, i);
     s.queue.init();
@@ -1162,6 +1206,14 @@ class Topic {
         ++rep.pins_cleared;
       }
     }
+    const uint64_t live_members = live >> kMaxPublishers;
+    for (uint32_t g = 1; g <= kMaxGroups; ++g) {
+      const uint64_t stale = group(g).member_mask.load(std::memory_order_acquire) & ~live_members;
+      if (stale) {
+        group(g).member_mask.fetch_and(~stale, std::memory_order_acq_rel);
+        ++rep.members_cleared;
+      }
+    }
     const uint64_t holders = live & detail::kHolderMask;
     for (uint32_t id = 0; id < kBlockCount; ++id) {
       const uint64_t observed = states[id];
@@ -1226,7 +1278,11 @@ class Topic {
       const auto& rec = region.groups[g];
       GroupInfo info;
       info.id = g;
-      info.members = rec.members.load(std::memory_order_relaxed);
+      info.member_mask = rec.member_mask.load(std::memory_order_relaxed);
+      info.members = static_cast<uint32_t>(__builtin_popcountll(info.member_mask));
+      const uint32_t policy = rec.policy.load(std::memory_order_relaxed);
+      info.policy_set = (policy & detail::kPolicySet) != 0;
+      info.overflow = static_cast<Overflow>(detail::policy_overflow(policy));
       info.queue_depth = rec.queue.size_approx();
       info.dropped_newest = rec.dropped_newest.load(std::memory_order_relaxed);
       info.dropped_oldest = rec.dropped_oldest.load(std::memory_order_relaxed);
